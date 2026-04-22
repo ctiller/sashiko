@@ -1211,6 +1211,10 @@ Example:
                     .map(|prefix| format!("{} s:{}] ", &prefix[..prefix.len() - 2], _stage)),
             };
 
+            info!(
+                "→ Requesting AI generation for Stage {} (Turn {})",
+                _stage, turns
+            );
             let resp = self.provider.generate_content(request).await?;
 
             if let Some(usage) = &resp.usage {
@@ -1232,6 +1236,10 @@ Example:
             if let Some(tool_calls) = resp.tool_calls {
                 let mut tool_responses = Vec::new();
                 for call in tool_calls {
+                    info!(
+                        "← Turn {} (Stage {}) calls tool: {}",
+                        turns, _stage, call.function_name
+                    );
                     let result = match self
                         .tools
                         .call(&call.function_name, call.arguments.clone())
@@ -1240,6 +1248,16 @@ Example:
                         Ok(v) => v.to_string(),
                         Err(e) => json!({"error": e.to_string()}).to_string(),
                     };
+                    let preview: String = result.chars().take(100).collect();
+                    let ellipsis = if result.chars().count() > 100 {
+                        "…"
+                    } else {
+                        ""
+                    };
+                    info!(
+                        "→ Tool {} returned: {}{}",
+                        call.function_name, preview, ellipsis
+                    );
                     tool_responses.push(AiMessage {
                         role: AiRole::Tool,
                         content: Some(result),
