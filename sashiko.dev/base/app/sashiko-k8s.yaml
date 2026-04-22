@@ -80,9 +80,10 @@ spec:
                 bpf,cgroups,damon,dmaengine,driver-core,dwarves,kvm,
                 linux-bluetooth,linux-cifs,linux-ext4,linux-hwmon,linux-input,
                 linux-kernel,linux-mm,linux-pci,linux-perf-users,linux-phy,
-                linux-rdma,linux-trace-kernel,linux-watchdog,mptcp,netdev,
+                linux-pwm,linux-rdma,linux-trace-kernel,linux-watchdog,mptcp,netdev,
                 rust-for-linux,kvmarm,linux-arm-kernel,linux-block,linux-scsi,
-                linux-crypto,linux-riscv,intel-gfx,intel-xe,linux-kselftest
+                linux-crypto,linux-riscv,intel-gfx,intel-xe,linux-kselftest,
+                kexec,linux-iio,netfilter-devel,linux-renesas-soc,linux-omap,linux-xfs
             - name: SASHIKO__REVIEW__CONCURRENCY
               value: "36"
             - name: SASHIKO__SMTP__SENDER_ADDRESS

@@ -28,7 +28,7 @@ pub struct SubsystemPolicy {
     #[serde(default)]
     pub reply_to_author: bool,
     #[serde(default)]
-    pub cc_maintainers: bool,
+    pub cc_individuals: bool,
     #[serde(default)]
     pub mute_all: bool,
     #[serde(default)]
@@ -37,6 +37,8 @@ pub struct SubsystemPolicy {
     pub ignored_emails: Vec<String>,
     #[serde(default)]
     pub patchwork: PatchworkPolicy,
+    #[serde(default)]
+    pub embargo_hours: Option<u32>,
 }
 
 impl EmailPolicyConfig {
@@ -69,7 +71,7 @@ mod tests {
             [defaults]
             reply_all = false
             reply_to_author = true
-            cc_maintainers = true
+            cc_individuals = true
             mute_all = false
             cc = []
 
@@ -77,13 +79,13 @@ mod tests {
             lists = ["linux-mm@kvack.org", "linux-mm@vger.kernel.org"]
             reply_all = true
             reply_to_author = true
-            cc_maintainers = true
+            cc_individuals = true
 
             [subsystems.bpf]
             lists = ["bpf@vger.kernel.org"]
             reply_all = false
             reply_to_author = true
-            cc_maintainers = false
+            cc_individuals = false
 
             [subsystems.net]
             lists = ["netdev@vger.kernel.org"]
@@ -114,7 +116,7 @@ mod tests {
         let bpf_policy = config.subsystems.get("bpf").expect("bpf subsystem missing");
         assert!(!bpf_policy.reply_all);
         assert!(bpf_policy.reply_to_author);
-        assert!(!bpf_policy.cc_maintainers);
+        assert!(!bpf_policy.cc_individuals);
 
         let net_policy = config.subsystems.get("net").expect("net subsystem missing");
         assert!(net_policy.mute_all);

@@ -56,6 +56,18 @@ pub struct PatchsetRow {
     pub prompts_git_hash: Option<String>,
     pub baseline_logs: Option<String>,
     pub provider: Option<String>,
+    #[serde(skip)]
+    pub embargo_until: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReleaseReview {
+    pub patch_id: i64,
+    pub patch_message_id: String,
+    pub index: i64,
+    pub inline_review: String,
+    pub summary: String,
+    pub findings: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -168,9 +180,42 @@ impl Database {
              libsql::params![id],
         ).await?;
 
-        if let Ok(Some(row)) = rows.next().await {
-            let thread_id: Option<i64> = row.get(2).ok();
+        let row_data = if let Ok(Some(row)) = rows.next().await {
+            Some((
+                row.get::<i64>(0)?,
+                row.get::<String>(1)?,
+                row.get::<Option<i64>>(2).ok().flatten(),
+                row.get::<Option<String>>(3).ok().flatten(),
+                row.get::<Option<String>>(4).ok().flatten(),
+                row.get::<Option<String>>(5).ok().flatten(),
+                row.get::<Option<i64>>(6).ok().flatten(),
+                row.get::<Option<String>>(7).ok().flatten(),
+                row.get::<Option<String>>(8).ok().flatten(),
+                row.get::<Option<String>>(9).ok().flatten(),
+                row.get::<Option<String>>(10).ok().flatten(),
+                row.get::<Option<String>>(11).ok().flatten(),
+                row.get::<Option<String>>(12).ok().flatten(),
+            ))
+        } else {
+            None
+        };
 
+        if let Some((
+            id,
+            message_id,
+            thread_id,
+            in_reply_to,
+            author,
+            subject,
+            date,
+            body,
+            to,
+            cc,
+            git_blob_hash,
+            mailing_list,
+            raw_diff,
+        )) = row_data
+        {
             // Fetch thread messages
             let mut messages = Vec::new();
             if let Some(tid) = thread_id {
@@ -190,31 +235,28 @@ impl Database {
                 }
             }
 
-            let body: Option<String> = row.get(7).ok();
-            let raw_diff: Option<String> = row.get(12).ok();
-
             // For email-based patches, the diff is often just the body.
             // We don't want to show it twice in the UI.
             // For git commits, body is the commit message and diff is the actual diff.
             let diff = if let (Some(b), Some(d)) = (&body, &raw_diff) {
-                if b == d { None } else { raw_diff }
+                if b == d { None } else { raw_diff.clone() }
             } else {
-                raw_diff
+                raw_diff.clone()
             };
 
             Ok(Some(MessageRow {
-                id: row.get(0)?,
-                message_id: row.get(1)?,
+                id,
+                message_id,
                 thread_id,
-                in_reply_to: row.get(3).ok(),
-                author: row.get(4).ok(),
-                subject: row.get(5).ok(),
-                date: row.get(6).ok(),
+                in_reply_to,
+                author,
+                subject,
+                date,
                 body,
-                to: row.get(8).ok(),
-                cc: row.get(9).ok(),
-                git_blob_hash: row.get(10).ok(),
-                mailing_list: row.get(11).ok(),
+                to,
+                cc,
+                git_blob_hash,
+                mailing_list,
                 diff,
                 thread: Some(messages),
             }))
@@ -232,8 +274,13 @@ impl Database {
             )
             .await?;
 
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
+        let id = if let Ok(Some(row)) = rows.next().await {
+            Some(row.get::<i64>(0)?)
+        } else {
+            None
+        };
+
+        if let Some(id) = id {
             self.get_message_details(id).await
         } else {
             Ok(None)
@@ -424,6 +471,16 @@ impl Database {
             .try_add_column("patchsets", "baseline_logs", "TEXT")
             .await;
         let _ = self.try_add_column("patchsets", "provider", "TEXT").await;
+        let _ = self
+            .try_add_column("patchsets", "embargo_until", "INTEGER")
+            .await;
+        let _ = self
+            .try_create_index(
+                "idx_patchsets_status_embargo_until",
+                "patchsets",
+                "status, embargo_until",
+            )
+            .await;
 
         let _ = self
             .conn
@@ -444,6 +501,27 @@ impl Database {
             .await;
         let _ = self
             .try_create_index("idx_tool_usages_review", "tool_usages", "review_id")
+            .await;
+        let _ = self
+            .try_create_index(
+                "idx_ai_interactions_tokens",
+                "ai_interactions",
+                "id, tokens_in, tokens_out, tokens_cached",
+            )
+            .await;
+        let _ = self
+            .try_create_index(
+                "idx_reviews_grouping",
+                "reviews",
+                "provider, model, status, interaction_id",
+            )
+            .await;
+        let _ = self
+            .try_create_index(
+                "idx_tool_usages_stats",
+                "tool_usages",
+                "provider, model, tool_name, output_length",
+            )
             .await;
 
         // Manual migration for messages_mailing_lists
@@ -726,30 +804,23 @@ impl Database {
     pub async fn migrate_tool_usages(&self) -> Result<()> {
         // 1. Check if we have logs to parse
         info!("Migration: Checking for tool usages to backfill...");
-        let mut rows = self.conn.query("SELECT id, logs, provider, model FROM reviews WHERE status IN ('Reviewed', 'Failed') AND logs IS NOT NULL", ()).await?;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT r.id, r.logs, r.provider, r.model 
+             FROM reviews r 
+             LEFT JOIN tool_usages t ON r.id = t.review_id 
+             WHERE r.status IN ('Reviewed', 'Failed') AND r.logs IS NOT NULL AND t.id IS NULL
+             GROUP BY r.id",
+                (),
+            )
+            .await?;
 
         while let Ok(Some(row)) = rows.next().await {
             let review_id: i64 = row.get(0)?;
             let logs: String = row.get(1)?;
             let provider: String = row.get(2).unwrap_or_else(|_| "unknown".to_string());
             let model: String = row.get(3).unwrap_or_else(|_| "unknown".to_string());
-
-            // Check if already populated
-            let count_rows = self
-                .conn
-                .query(
-                    "SELECT count(*) FROM tool_usages WHERE review_id = ?",
-                    libsql::params![review_id],
-                )
-                .await;
-            if let Ok(mut c_rows) = count_rows
-                && let Ok(Some(c_row)) = c_rows.next().await
-            {
-                let count: i64 = c_row.get(0)?;
-                if count > 0 {
-                    continue;
-                }
-            }
 
             // Parse logs (simple JSON array parsing)
             if let Ok(history) = serde_json::from_str::<Vec<serde_json::Value>>(&logs) {
@@ -814,33 +885,18 @@ impl Database {
     pub async fn migrate_findings(&self) -> Result<()> {
         info!("Migration: Checking for findings to backfill...");
         // Select reviews that have AI output but maybe no findings in the new table
-        let sql = "SELECT r.id, ai.output_raw 
-                   FROM reviews r 
+        let sql = "SELECT r.id, ai.output_raw
+                   FROM reviews r
                    JOIN ai_interactions ai ON r.interaction_id = ai.id
-                   WHERE r.status = 'Reviewed'";
+                   LEFT JOIN findings f ON r.id = f.review_id
+                   WHERE r.status = 'Reviewed' AND f.id IS NULL
+                   GROUP BY r.id";
 
         let mut rows = self.conn.query(sql, ()).await?;
 
         while let Ok(Some(row)) = rows.next().await {
             let review_id: i64 = row.get(0)?;
             let output_raw: String = row.get(1)?;
-
-            // Check if we already have findings for this review
-            let count_check = self
-                .conn
-                .query(
-                    "SELECT count(*) FROM findings WHERE review_id = ?",
-                    libsql::params![review_id],
-                )
-                .await;
-            if let Ok(mut c_rows) = count_check
-                && let Ok(Some(c_row)) = c_rows.next().await
-            {
-                let count: i64 = c_row.get(0)?;
-                if count > 0 {
-                    continue;
-                }
-            }
 
             // Parse JSON and insert findings
             if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&output_raw)
@@ -1066,16 +1122,16 @@ impl Database {
     }
 
     pub async fn get_review_stats(&self) -> Result<serde_json::Value> {
-        let sql = "SELECT 
-            r.provider, 
-            r.model, 
-            r.status, 
+        let sql = "SELECT
+            r.provider,
+            r.model,
+            r.status,
             count(*),
             sum(COALESCE(ai.tokens_in, 0)),
             sum(COALESCE(ai.tokens_out, 0)),
             sum(COALESCE(ai.tokens_cached, 0))
         FROM reviews r
-        LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
+        LEFT JOIN ai_interactions ai INDEXED BY idx_ai_interactions_tokens ON r.interaction_id = ai.id
         GROUP BY r.provider, r.model, r.status";
 
         let mut rows = self.conn.query(sql, ()).await?;
@@ -2104,6 +2160,16 @@ impl Database {
         }
     }
 
+    pub async fn set_patchset_embargo_until(&self, id: i64, embargo_until: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET embargo_until = ? WHERE id = ?",
+                libsql::params![embargo_until, id],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_patchsets(
         &self,
         limit: usize,
@@ -2118,7 +2184,8 @@ impl Database {
 
         let sql = format!(
             "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, GROUP_CONCAT(s.name, ','),
-             COALESCE(f.low, 0), COALESCE(f.medium, 0), COALESCE(f.high, 0), COALESCE(f.critical, 0), p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters
+             COALESCE(f.low, 0), COALESCE(f.medium, 0), COALESCE(f.high, 0), COALESCE(f.critical, 0), p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters,
+             p.embargo_until
              FROM patchsets p
              LEFT JOIN patchsets_subsystems ps ON p.id = ps.patchset_id
              LEFT JOIN subsystems s ON ps.subsystem_id = s.id
@@ -2148,43 +2215,80 @@ impl Database {
 
         let mut rows = self.conn.query(&sql, args).await?;
 
-        let mut patchsets = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
-            let subsystems_str: Option<String> = row.get(9).ok();
-            let subsystems = if let Some(s) = subsystems_str {
-                s.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
 
-            patchsets.push(PatchsetRow {
-                id: row.get(0)?,
-                subject: row.get(1).ok(),
-                status: row.get(2).ok(),
-                thread_id: row.get(3).ok(),
-                author: row.get(4).ok(),
-                date: row.get(5).ok(),
-                message_id: row.get(6).ok(),
-                total_parts: row.get(7).ok(),
-                received_parts: row.get(8).ok(),
-                subsystems,
-                findings_low: row.get(10).ok(),
-                findings_medium: row.get(11).ok(),
-                findings_high: row.get(12).ok(),
-                findings_critical: row.get(13).ok(),
-                baseline_id: row.get(14).ok(),
-                failed_reason: row.get(15).ok(),
-                target_review_count: row.get(16).ok(),
-                skip_filters: row.get(17).ok(),
-                only_filters: row.get(18).ok(),
-                model_name: None,
-                prompts_git_hash: None,
-                baseline_logs: None,
-                provider: None,
-            });
+        let mut patchsets = Vec::new();
+        loop {
+            match rows.next().await {
+                Ok(Some(row)) => {
+                    let subsystems_str: Option<String> = row.get(9).ok();
+                    let subsystems = if let Some(s) = subsystems_str {
+                        s.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+
+                    let embargo_until: Option<i64> = row.get(19).ok();
+                    let is_embargoed = if let Some(until) = embargo_until {
+                        until > now
+                    } else {
+                        false
+                    };
+
+                    let (low, medium, high, critical) = if is_embargoed {
+                        (0, 0, 0, 0)
+                    } else {
+                        (
+                            row.get::<Option<i64>>(10).ok().flatten().unwrap_or(0),
+                            row.get::<Option<i64>>(11).ok().flatten().unwrap_or(0),
+                            row.get::<Option<i64>>(12).ok().flatten().unwrap_or(0),
+                            row.get::<Option<i64>>(13).ok().flatten().unwrap_or(0),
+                        )
+                    };
+
+                    let mut status: Option<String> = row.get(2).ok();
+                    if is_embargoed && status.as_deref() == Some("Reviewed") {
+                        status = Some("Embargoed".to_string());
+                    }
+
+                    patchsets.push(PatchsetRow {
+                        id: row.get(0).unwrap_or_default(),
+                        subject: row.get(1).ok(),
+                        status,
+                        thread_id: row.get(3).ok(),
+                        author: row.get(4).ok(),
+                        date: row.get(5).ok(),
+                        message_id: row.get(6).ok(),
+                        total_parts: row.get(7).ok(),
+                        received_parts: row.get(8).ok(),
+                        subsystems,
+                        findings_low: Some(low),
+                        findings_medium: Some(medium),
+                        findings_high: Some(high),
+                        findings_critical: Some(critical),
+                        baseline_id: row.get(14).ok(),
+                        failed_reason: row.get(15).ok(),
+                        target_review_count: row.get(16).ok(),
+                        skip_filters: row.get(17).ok(),
+                        only_filters: row.get(18).ok(),
+                        model_name: None,
+                        prompts_git_hash: None,
+                        baseline_logs: None,
+                        provider: None,
+                        embargo_until: row.get(19).ok(),
+                    });
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::error!("Error fetching row: {:?}", e);
+                    break;
+                }
+            }
         }
         Ok(patchsets)
     }
@@ -2258,8 +2362,8 @@ impl Database {
     pub async fn count_pending_patches(&self) -> Result<usize> {
         let mut rows = self.conn.query(
             "SELECT COUNT(p.id) FROM patches p JOIN patchsets ps ON p.patchset_id = ps.id 
-             WHERE ps.status IN ('Pending', 'In Review') AND p.status = 'Pending' 
-             AND p.id NOT IN (SELECT patch_id FROM reviews WHERE status IN ('Pending', 'In Review', 'Applying') AND patch_id IS NOT NULL)",
+             WHERE ps.status IN ('Pending', 'In Review') AND p.status IS NULL
+             AND p.id NOT IN (SELECT patch_id FROM reviews WHERE status IN ('In Review', 'Applying') AND patch_id IS NOT NULL)",
             ()
         ).await?;
         if let Ok(Some(row)) = rows.next().await {
@@ -2272,7 +2376,7 @@ impl Database {
 
     pub async fn count_reviewing_patches(&self) -> Result<usize> {
         let mut rows = self.conn.query(
-            "SELECT COUNT(DISTINCT patch_id) FROM reviews WHERE status IN ('Pending', 'In Review', 'Applying') AND patch_id IS NOT NULL",
+            "SELECT COUNT(DISTINCT patch_id) FROM reviews WHERE status IN ('In Review', 'Applying') AND patch_id IS NOT NULL",
             ()
         ).await?;
         if let Ok(Some(row)) = rows.next().await {
@@ -2317,7 +2421,8 @@ impl Database {
                 "SELECT p.id, p.subject, p.status, p.to_recipients, p.cc_recipients,
                     p.author, p.date, p.cover_letter_message_id, p.thread_id,
                     p.total_parts, p.received_parts, p.failed_reason,
-                    p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id, p.provider
+                    p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id, p.provider,
+                    p.embargo_until
                 FROM patchsets p
                 WHERE p.id = ?",
                 libsql::params![id],
@@ -2342,6 +2447,7 @@ impl Database {
             let baseline_logs: Option<String> = row.get(14).ok();
             let baseline_id: Option<i64> = row.get(15).ok();
             let provider: Option<String> = row.get(16).ok();
+            let embargo_until: Option<i64> = row.get(17).ok();
             // Fetch baseline details if needed
             let baseline = if let Some(bid) = baseline_id {
                 let mut browse = self
@@ -2384,7 +2490,6 @@ impl Database {
                 subsystems.push(row.get::<String>(0)?);
             }
 
-            // Count total patches
             let mut total_patches = 0;
             let mut count_rows = self
                 .conn
@@ -2396,6 +2501,16 @@ impl Database {
             if let Ok(Some(row)) = count_rows.next().await {
                 total_patches = row.get::<i64>(0)?;
             }
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs() as i64;
+
+            let is_embargoed = if let Some(until) = embargo_until {
+                until > now
+            } else {
+                false
+            };
 
             // Fetch patches with subject and msg_db_id
             let mut patches = Vec::new();
@@ -2418,13 +2533,17 @@ impl Database {
             while let Ok(Some(p)) = patch_rows.next().await {
                 let p_id: i64 = p.get(0)?;
                 patch_ids.push(p_id);
+                let mut p_status = p.get::<Option<String>>(5).ok().flatten();
+                if is_embargoed && p_status.as_deref() == Some("Reviewed") {
+                    p_status = Some("Embargoed".to_string());
+                }
                 patches.push(serde_json::json!({
                     "id": p_id,
                     "message_id": p.get::<String>(1)?,
                     "part_index": p.get::<Option<i64>>(2).ok(),
                     "msg_db_id": p.get::<Option<i64>>(3).ok(),
                     "subject": p.get::<Option<String>>(4).ok(),
-                    "status": p.get::<Option<String>>(5).ok(),
+                    "status": p_status,
                     "apply_error": p.get::<Option<String>>(6).ok(),
                     "email_status": p.get::<Option<String>>(7).ok(),
                     "email_to": p.get::<Option<String>>(8).ok(),
@@ -2493,13 +2612,20 @@ impl Database {
                 }
             }
 
+            let mut final_status = status;
+            if is_embargoed && final_status.as_deref() == Some("Reviewed") {
+                final_status = Some("Embargoed".to_string());
+            }
+
+            let reviews = if is_embargoed { Vec::new() } else { reviews };
+
             Ok(Some(serde_json::json!({
                 "id": pid,
                 "message_id": mid,
                 "subject": subject,
                 "author": author,
                 "date": date,
-                "status": status,
+                "status": final_status,
                 "failed_reason": failed_reason,
                 "to": to,
                 "cc": cc,
@@ -2516,7 +2642,8 @@ impl Database {
                 "prompts_git_hash": prompts_git_hash,
                 "baseline_logs": baseline_logs,
                 "baseline": baseline,
-                "provider": provider
+                "provider": provider,
+                "embargo_until": embargo_until
             })))
         } else {
             Ok(None)
@@ -2535,7 +2662,8 @@ impl Database {
                 "SELECT p.id, p.subject, p.status, p.to_recipients, p.cc_recipients,
                     p.author, p.date, p.cover_letter_message_id, p.thread_id,
                     p.total_parts, p.received_parts, p.failed_reason,
-                    p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id, p.provider
+                    p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id, p.provider,
+                    p.embargo_until
                 FROM patchsets p
                 WHERE p.id = ?",
                 libsql::params![id],
@@ -2560,6 +2688,7 @@ impl Database {
             let baseline_logs: Option<String> = row.get(14).ok();
             let baseline_id: Option<i64> = row.get(15).ok();
             let provider: Option<String> = row.get(16).ok();
+            let embargo_until: Option<i64> = row.get(17).ok();
             let baseline = if let Some(bid) = baseline_id {
                 let mut browse = self
                     .conn
@@ -2611,6 +2740,16 @@ impl Database {
                 total_patches = row.get::<i64>(0)?;
             }
 
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs() as i64;
+
+            let is_embargoed = if let Some(until) = embargo_until {
+                until > now
+            } else {
+                false
+            };
+
             let mut patches = Vec::new();
             let mut patch_ids = Vec::new();
             let mut patch_rows = self
@@ -2632,13 +2771,17 @@ impl Database {
             while let Ok(Some(p)) = patch_rows.next().await {
                 let p_id: i64 = p.get(0)?;
                 patch_ids.push(p_id);
+                let mut p_status = p.get::<Option<String>>(5).ok().flatten();
+                if is_embargoed && p_status.as_deref() == Some("Reviewed") {
+                    p_status = Some("Embargoed".to_string());
+                }
                 patches.push(serde_json::json!({
                     "id": p_id,
                     "message_id": p.get::<String>(1)?,
                     "part_index": p.get::<Option<i64>>(2).ok(),
                     "msg_db_id": p.get::<Option<i64>>(3).ok(),
                     "subject": p.get::<Option<String>>(4).ok(),
-                    "status": p.get::<Option<String>>(5).ok(),
+                    "status": p_status,
                     "apply_error": p.get::<Option<String>>(6).ok(),
                     "email_status": p.get::<Option<String>>(7).ok(),
                     "email_to": p.get::<Option<String>>(8).ok(),
@@ -2704,13 +2847,20 @@ impl Database {
                 }
             }
 
+            let mut final_status = status;
+            if is_embargoed && final_status.as_deref() == Some("Reviewed") {
+                final_status = Some("Embargoed".to_string());
+            }
+
+            let reviews = if is_embargoed { Vec::new() } else { reviews };
+
             Ok(Some(serde_json::json!({
                 "id": pid,
                 "message_id": mid,
                 "subject": subject,
                 "author": author,
                 "date": date,
-                "status": status,
+                "status": final_status,
                 "failed_reason": failed_reason,
                 "to": to,
                 "cc": cc,
@@ -2727,7 +2877,8 @@ impl Database {
                 "prompts_git_hash": prompts_git_hash,
                 "baseline_logs": baseline_logs,
                 "baseline": baseline,
-                "provider": provider
+                "provider": provider,
+                "embargo_until": embargo_until
             })))
         } else {
             Ok(None)
@@ -2864,7 +3015,7 @@ impl Database {
 
     pub async fn get_pending_patchsets(&self, limit: usize) -> Result<Vec<PatchsetRow>> {
         let mut rows = self.conn.query(
-            "SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count, skip_filters, only_filters
+            "SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count, skip_filters, only_filters, embargo_until
              FROM patchsets WHERE status = 'Pending' ORDER BY date ASC LIMIT ?",
             libsql::params![limit as i64],
         ).await?;
@@ -2872,7 +3023,7 @@ impl Database {
         let mut patchsets = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             patchsets.push(PatchsetRow {
-                id: row.get(0)?,
+                id: row.get(0).unwrap_or_default(),
                 subject: row.get(1).ok(),
                 status: row.get(2).ok(),
                 thread_id: row.get(3).ok(),
@@ -2895,9 +3046,143 @@ impl Database {
                 prompts_git_hash: None,
                 baseline_logs: None,
                 provider: None,
+                embargo_until: row.get(14).ok(),
             });
         }
         Ok(patchsets)
+    }
+
+    pub async fn get_expired_embargoed_patchsets(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> Result<Vec<PatchsetRow>> {
+        let mut rows = self.conn.query(
+            "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters, p.embargo_until
+             FROM patchsets p
+             WHERE p.status = 'Reviewed' AND p.embargo_until IS NOT NULL AND p.embargo_until <= ? 
+             AND NOT EXISTS (
+                 SELECT 1 FROM email_outbox eo 
+                 JOIN patches pa ON eo.patch_id = pa.id 
+                 WHERE pa.patchset_id = p.id
+             ) 
+             ORDER BY p.date ASC LIMIT ?",
+            libsql::params![now, limit as i64],
+        ).await?;
+
+        let mut patchsets = Vec::new();
+        loop {
+            match rows.next().await {
+                Ok(Some(row)) => {
+                    patchsets.push(PatchsetRow {
+                        id: row.get(0).unwrap_or_default(),
+                        subject: row.get(1).ok(),
+                        status: row.get(2).ok(),
+                        thread_id: row.get(3).ok(),
+                        author: row.get(4).ok(),
+                        date: row.get(5).ok(),
+                        message_id: row.get(6).ok(),
+                        total_parts: row.get(7).ok(),
+                        received_parts: row.get(8).ok(),
+                        subsystems: Vec::new(),
+                        findings_low: None,
+                        findings_medium: None,
+                        findings_high: None,
+                        findings_critical: None,
+                        baseline_id: row.get(9).ok(),
+                        failed_reason: row.get(10).ok(),
+                        target_review_count: row.get(11).ok(),
+                        skip_filters: row.get(12).ok(),
+                        only_filters: row.get(13).ok(),
+                        model_name: None,
+                        prompts_git_hash: None,
+                        baseline_logs: None,
+                        provider: None,
+                        embargo_until: row.get(14).ok(),
+                    });
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::error!("Error fetching row: {:?}", e);
+                    break;
+                }
+            }
+        }
+        Ok(patchsets)
+    }
+
+    pub async fn get_completed_reviews_for_release(
+        &self,
+        patchset_id: i64,
+    ) -> Result<Vec<ReleaseReview>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT r.id, r.patch_id, r.inline_review, r.summary, m.message_id, p.part_index
+             FROM reviews r
+             JOIN patches p ON r.patch_id = p.id
+             JOIN messages m ON p.message_id = m.message_id
+             WHERE r.patchset_id = ? AND r.status = 'Reviewed'",
+                libsql::params![patchset_id],
+            )
+            .await?;
+
+        let mut temp_reviews = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let review_id: i64 = row.get(0)?;
+            let patch_id: i64 = row.get(1)?;
+            let inline_review: String = row.get(2).unwrap_or_default();
+            let summary: String = row.get(3).unwrap_or_default();
+            let patch_message_id: String = row.get(4).unwrap_or_default();
+            let index: i64 = row.get(5).unwrap_or_default();
+            temp_reviews.push((
+                review_id,
+                patch_id,
+                inline_review,
+                summary,
+                patch_message_id,
+                index,
+            ));
+        }
+
+        let mut reviews = Vec::new();
+        for (review_id, patch_id, inline_review, summary, patch_message_id, index) in temp_reviews {
+            // Fetch findings for this review
+            let mut findings_rows = self.conn.query(
+                "SELECT severity, problem, severity_explanation FROM findings WHERE review_id = ?",
+                libsql::params![review_id],
+            ).await?;
+
+            let mut findings = Vec::new();
+            while let Ok(Some(f_row)) = findings_rows.next().await {
+                let severity_int: i64 = f_row.get(0).unwrap_or(1);
+                let severity = match severity_int {
+                    4 => "Critical",
+                    3 => "High",
+                    2 => "Medium",
+                    _ => "Low",
+                }
+                .to_string();
+                let problem: String = f_row.get(1).unwrap_or_default();
+                let severity_explanation: Option<String> = f_row.get(2).ok();
+
+                findings.push(json!({
+                    "severity": severity,
+                    "problem": problem,
+                    "severity_explanation": severity_explanation,
+                }));
+            }
+
+            reviews.push(ReleaseReview {
+                patch_id,
+                patch_message_id,
+                index,
+                inline_review,
+                summary,
+                findings,
+            });
+        }
+        Ok(reviews)
     }
 
     pub async fn update_patchset_status(&self, id: i64, status: &str) -> Result<()> {
@@ -3682,6 +3967,114 @@ mod tests {
         db.create_patch(ps_id, "msg_2", 2, "diff").await.unwrap();
         let list = db.get_patchsets(1, 0, None, None).await.unwrap();
         assert_eq!(list[0].status.as_deref(), Some("Pending"));
+    }
+
+    #[tokio::test]
+    async fn test_embargoed_patchset_dynamic_recalculation() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("root_embargo", "Embargo Test", 60000)
+            .await
+            .unwrap();
+        let author = "Embargo Author <embargo@example.com>";
+
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_embargo",
+                "Embargo Test",
+                author,
+                60000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_message(
+            "msg_embargo",
+            thread_id,
+            None,
+            author,
+            "Embargo Test",
+            60000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_patch(ps_id, "msg_embargo", 1, "diff")
+            .await
+            .unwrap();
+
+        db.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Reviewed' WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        db.set_patchset_embargo_until(ps_id, now + 3600)
+            .await
+            .unwrap();
+
+        db.create_review(ps_id, None, "gemini", "test-model", None, None)
+            .await
+            .unwrap();
+
+        let patchsets = db.get_patchsets(10, 0, None, None).await.unwrap();
+        assert_eq!(patchsets[0].status.as_deref(), Some("Embargoed"));
+        let details = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            details
+                .get("reviews")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        db.set_patchset_embargo_until(ps_id, now - 3600)
+            .await
+            .unwrap();
+
+        let patchsets = db.get_patchsets(10, 0, None, None).await.unwrap();
+        assert_eq!(patchsets[0].status.as_deref(), Some("Reviewed"));
+        let details = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !details
+                .get("reviews")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

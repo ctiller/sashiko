@@ -499,7 +499,7 @@ impl Worker {
 
         let selected_prompts = if let Some(subsystem_md) = subsystem_md {
             info!("Executing Phase 0: Pre-screening relevant subsystem guides.");
-            let phase0_system = "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.";
+            let phase0_system = "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"networking.md\", \"locking.md\"]}\n```";
             let phase0_prompt = format!(
                 "<subsystem_guide_index>\n{}\n</subsystem_guide_index>\n\n<patch>\n{}\n</patch>",
                 subsystem_md, target_commit_diff
@@ -535,45 +535,27 @@ impl Worker {
                     .map(|prefix| format!("{}s:0] ", &prefix[..prefix.len() - 2])),
             };
 
-            match self.provider.generate_content(req).await {
-                Ok(resp) => {
-                    if let Some(usage) = &resp.usage {
-                        total_tokens_in += usage.prompt_tokens as u32;
-                        total_tokens_out += usage.completion_tokens as u32;
-                        total_tokens_cached += usage.cached_tokens.unwrap_or(0) as u32;
-                    }
-                    if let Some(content) = resp.content {
-                        match serde_json::from_str::<Value>(&content) {
-                            Ok(val) => {
-                                if let Some(arr) =
-                                    val.get("selected_prompts").and_then(|v| v.as_array())
-                                {
-                                    let prompts: Vec<String> = arr
-                                        .iter()
-                                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                        .collect();
-                                    info!("Phase 0 selected prompts: {:?}", prompts);
-                                    Some(prompts)
-                                } else {
-                                    warn!("Phase 0 JSON did not contain 'selected_prompts' array");
-                                    None
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Phase 0 JSON parse error: {}", e);
-                                None
-                            }
-                        }
-                    } else {
-                        warn!("Phase 0 returned no content");
-                        None
-                    }
-                }
-                Err(e) => {
-                    warn!("Phase 0 completion failed: {}", e);
-                    None
-                }
-            }
+            let mut tokens = (total_tokens_in, total_tokens_out, total_tokens_cached);
+            let val = self
+                .json_request("s0", req, &mut tokens, |v| {
+                    v.get("selected_prompts")
+                        .and_then(|v| v.as_array())
+                        .ok_or_else(|| "missing 'selected_prompts' array".to_string())
+                        .map(|_| ())
+                })
+                .await;
+            total_tokens_in = tokens.0;
+            total_tokens_out = tokens.1;
+            total_tokens_cached = tokens.2;
+            val.and_then(|val| {
+                let arr = val.get("selected_prompts")?.as_array()?;
+                let prompts: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                info!("Phase 0 selected prompts: {:?}", prompts);
+                Some(prompts)
+            })
         } else {
             warn!("subsystem.md not found for Phase 0");
             None
@@ -658,8 +640,12 @@ impl Worker {
 - Stage 6: Security audit
 - Stage 7: Hardware engineer's review
 
-Return ONLY a JSON object containing an array of integers representing the relevant stages (e.g., [4, 5, 6, 7]).
-CRITICAL: Always err on the side of running more stages. If you are not absolutely sure, include the stage. If the patch is a trivial typo fix, you may omit some stages. Stages 1, 2, and 3 are always run and should not be included in your answer."#;
+CRITICAL: Always err on the side of running more stages. If you are not absolutely sure, include the stage. If the patch is a trivial typo fix, you may omit some stages. Stages 1, 2, and 3 are always run and should not be included in your answer.
+
+You MUST respond with ONLY a JSON object, no other text. Example:
+```json
+{"relevant_stages": [4, 5, 6, 7]}
+```"#;
 
             let req = AiRequest {
                 system: None,
@@ -682,42 +668,30 @@ CRITICAL: Always err on the side of running more stages. If you are not absolute
             };
 
             info!("Running planning pre-phase");
-            match self.provider.generate_content(req).await {
-                Ok(resp) => {
-                    if let Some(usage) = &resp.usage {
-                        total_tokens_in += usage.prompt_tokens as u32;
-                        total_tokens_out += usage.completion_tokens as u32;
-                        total_tokens_cached += usage.cached_tokens.unwrap_or(0) as u32;
-                    }
-                    if let Some(content) = resp.content {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                            if let Some(arr) = val.get("relevant_stages").and_then(|v| v.as_array())
-                            {
-                                let mut stages = vec![1, 2, 3];
-                                for v in arr {
-                                    if let Some(n) = v.as_u64()
-                                        && (4..=7).contains(&n)
-                                    {
-                                        stages.push(n as u8);
-                                    }
-                                }
-                                info!("Planning phase selected stages: {:?}", stages);
-                                planning_selected_stages = Some(stages);
-                            } else {
-                                warn!(
-                                    "Planning phase JSON did not contain 'relevant_stages' array"
-                                );
-                            }
-                        } else {
-                            warn!("Planning phase JSON parse error");
-                        }
-                    } else {
-                        warn!("Planning phase returned no content");
+            let mut tokens = (total_tokens_in, total_tokens_out, total_tokens_cached);
+            let val = self
+                .json_request("sp", req, &mut tokens, |v| {
+                    v.get("relevant_stages")
+                        .and_then(|v| v.as_array())
+                        .ok_or_else(|| "missing 'relevant_stages' array".to_string())
+                        .map(|_| ())
+                })
+                .await;
+            total_tokens_in = tokens.0;
+            total_tokens_out = tokens.1;
+            total_tokens_cached = tokens.2;
+            if let Some(val) = val {
+                let arr = val["relevant_stages"].as_array().unwrap();
+                let mut stages = vec![1, 2, 3];
+                for v in arr {
+                    if let Some(n) = v.as_u64()
+                        && (4..=7).contains(&n)
+                    {
+                        stages.push(n as u8);
                     }
                 }
-                Err(e) => {
-                    warn!("Planning phase failed: {}", e);
-                }
+                info!("Planning phase selected stages: {:?}", stages);
+                planning_selected_stages = Some(stages);
             }
         }
 
@@ -1298,6 +1272,94 @@ Example:
         }
 
         Err(ReviewError::LimitExceeded.into())
+    }
+
+    async fn json_request(
+        &self,
+        label: &str,
+        req: AiRequest,
+        tokens: &mut (u32, u32, u32),
+        validate: impl Fn(&Value) -> Result<(), String>,
+    ) -> Option<Value> {
+        fn accumulate(tokens: &mut (u32, u32, u32), usage: &crate::ai::AiUsage) {
+            tokens.0 += usage.prompt_tokens as u32;
+            tokens.1 += usage.completion_tokens as u32;
+            tokens.2 += usage.cached_tokens.unwrap_or(0) as u32;
+        }
+
+        fn try_parse(
+            content: &str,
+            validate: &impl Fn(&Value) -> Result<(), String>,
+        ) -> Result<Value, String> {
+            let stripped = content.trim();
+            let stripped = stripped
+                .strip_prefix("```json")
+                .or_else(|| stripped.strip_prefix("```"))
+                .map(|s| s.strip_suffix("```").unwrap_or(s).trim())
+                .unwrap_or(stripped);
+            let v = serde_json::from_str::<Value>(stripped)
+                .map_err(|e| format!("JSON parse error: {}", e))?;
+            validate(&v)?;
+            Ok(v)
+        }
+
+        let retry_base = req.clone();
+        let resp = match self.provider.generate_content(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("{} completion failed: {}", label, e);
+                return None;
+            }
+        };
+        if let Some(usage) = &resp.usage {
+            accumulate(tokens, usage);
+        }
+        let content = resp.content.as_deref().unwrap_or("");
+        match try_parse(content, &validate) {
+            Ok(v) => return Some(v),
+            Err(e) => {
+                warn!("{}: {}, retrying with correction", label, e);
+                let mut retry_req = retry_base;
+                retry_req.messages.push(AiMessage {
+                    role: AiRole::Assistant,
+                    content: Some(content.to_string()),
+                    thought: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                retry_req.messages.push(AiMessage {
+                    role: AiRole::User,
+                    content: Some(format!(
+                        "Your response is not valid: {}\nRespond with ONLY valid JSON conforming to the schema. No markdown, no explanation.",
+                        e
+                    )),
+                    thought: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                match self.provider.generate_content(retry_req).await {
+                    Ok(resp2) => {
+                        if let Some(usage) = &resp2.usage {
+                            accumulate(tokens, usage);
+                        }
+                        let content2 = resp2.content.as_deref().unwrap_or("");
+                        match try_parse(content2, &validate) {
+                            Ok(v) => {
+                                warn!("{} succeeded on retry (first attempt was invalid)", label);
+                                return Some(v);
+                            }
+                            Err(e2) => {
+                                warn!("{} failed on retry too: {}", label, e2);
+                            }
+                        }
+                    }
+                    Err(e2) => {
+                        warn!("{} retry request failed: {}", label, e2);
+                    }
+                }
+            }
+        }
+        None
     }
 }
 

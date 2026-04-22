@@ -110,12 +110,31 @@ pub struct GeminiSettings {
     pub explicit_prompt_caching: bool,
 }
 
+#[cfg(feature = "bedrock")]
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
 pub struct BedrockSettings {
     /// AWS region for Bedrock API calls (e.g. "us-east-1").
     /// If omitted, uses the standard AWS SDK default chain.
     pub region: Option<String>,
+    #[serde(default = "default_prompt_caching")]
+    pub prompt_caching: bool,
+    /// Max output tokens per Converse call.
+    #[serde(default = "default_bedrock_max_tokens")]
+    pub max_tokens: u32,
+    /// Thinking mode sent as additional_model_request_fields. Opus 4.7 only accepts "adaptive".
+    /// Leave unset to omit (thinking disabled). Valid values: "adaptive".
+    #[serde(default)]
+    pub thinking: Option<String>,
+    /// output_config.effort level. Valid values: "low", "medium", "high", "xhigh", "max".
+    /// Leave unset to use the model default. "xhigh" is Opus 4.7-only.
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+#[cfg(feature = "bedrock")]
+fn default_bedrock_max_tokens() -> u32 {
+    8192
 }
 
 fn default_prompt_caching() -> bool {
@@ -155,6 +174,7 @@ pub struct AiSettings {
     // Provider-specific settings
     pub claude: Option<ClaudeSettings>,
     pub gemini: Option<GeminiSettings>,
+    #[cfg(feature = "bedrock")]
     pub bedrock: Option<BedrockSettings>,
     pub openai_compat: Option<OpenAiCompatSettings>,
 }

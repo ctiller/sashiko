@@ -43,3 +43,21 @@ cc = ["damon@lists.linux.dev"]
 lists = ["linux-ext4@vger.kernel.org"]
 reply_to_author = true
 cc = ["tytso@mit.edu"]
+
+[subsystems.net]
+lists = ["netdev@vger.kernel.org"]
+embargo_hours = 24
+
+[subsystems.cgroups]
+lists = ["cgroups@vger.kernel.org"]
+reply_to_author = true
+cc = ["tj@kernel.org", "hannes@cmpxchg.org", "mkoutny@suse.com"]
+
+[subsystems.renesas-soc]
+lists = ["linux-renesas-soc@vger.kernel.org"]
+cc = ["wsa+renesas@sang-engineering.com"]
+
+[subsystems.rust-for-linux]
+lists = ["rust-for-linux@vger.kernel.org"]
+reply_to_author = true
+cc = ["ojeda@kernel.org"]
