@@ -43,8 +43,8 @@ struct Args {
     ai_model: String,
 
     /// Prompt directory.
-    #[arg(long, default_value = "third_party/prompts/kernel")]
-    prompts: PathBuf,
+    #[arg(long)]
+    prompts: Option<PathBuf>,
 
     /// Custom prompt string to append to the user task prompt.
     #[arg(long)]
@@ -171,7 +171,7 @@ async fn main() -> Result<()> {
             },
         })?;
 
-        let prompts_tool_path = Some(args.prompts.join("tool.md"));
+        let prompts_tool_path = args.prompts.as_ref().map(|p| p.join("tool.md"));
         let tools = ToolBox::new(worktree.path.clone(), prompts_tool_path);
         let prompts = PromptRegistry::new(args.prompts.clone());
 
