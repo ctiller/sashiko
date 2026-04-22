@@ -61,17 +61,6 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let repo_path = args.repo.unwrap_or_else(|| PathBuf::from("."));
-    let current_sha = git_ops::get_commit_hash(&repo_path, "HEAD").await?;
-
-    let branch_name = format!("temp-review-{}", &current_sha[..8]);
-
-    info!(
-        "Creating squashed branch {} for range {}",
-        branch_name, args.range
-    );
-    let squashed_sha =
-        git_ops::git_create_squashed_branch(&repo_path, &args.range, &branch_name).await?;
-
     info!(
         "Resolving baseline: {}",
         args.range.split("..").next().unwrap_or("HEAD~1")
@@ -82,15 +71,65 @@ async fn main() -> Result<()> {
     )
     .await?;
 
+    let diff_output = tokio::process::Command::new("git")
+        .current_dir(&repo_path)
+        .args(["diff", &args.range])
+        .output()
+        .await?;
+
+    if !diff_output.status.success() {
+        anyhow::bail!(
+            "Failed to generate diff for range {}: {}",
+            args.range,
+            String::from_utf8_lossy(&diff_output.stderr)
+        );
+    }
+    let diff_str = String::from_utf8_lossy(&diff_output.stdout);
+
     let worktree = GitWorktree::new(&repo_path, &baseline_sha, None).await?;
 
     let res = async {
-        worktree.reset_hard(&squashed_sha).await?;
+        let apply_result = worktree.apply_raw_diff(&diff_str).await?;
+
+        if !apply_result.status.success() {
+            anyhow::bail!(
+                "Failed to apply diff: {}",
+                String::from_utf8_lossy(&apply_result.stderr)
+            );
+        }
+
+        tokio::process::Command::new("git")
+            .current_dir(&worktree.path)
+            .args(["add", "."])
+            .output()
+            .await?;
+
+        tokio::process::Command::new("git")
+            .current_dir(&worktree.path)
+            .args([
+                "-c",
+                "user.email=sashiko@localhost",
+                "-c",
+                "user.name=Sashiko Bot",
+                "commit",
+                "-m",
+                "Squashed review commit",
+            ])
+            .output()
+            .await?;
+
+        let squashed_sha = git_ops::get_commit_hash(&worktree.path, "HEAD").await?;
 
         let provider = ai::create_provider(&Settings {
             log_level: "info".to_string(),
-            database: sashiko::settings::DatabaseSettings { url: "".to_string(), token: "".to_string() },
-            nntp: sashiko::settings::NntpSettings { server: "".to_string(), port: 0 },
+            database: sashiko::settings::DatabaseSettings {
+                url: "".to_string(),
+                token: "".to_string(),
+            },
+            nntp: sashiko::settings::NntpSettings {
+                server: "".to_string(),
+                port: 0,
+            },
             smtp: None,
             mailing_lists: sashiko::settings::MailingListsSettings { track: vec![] },
             ai: sashiko::settings::AiSettings {
@@ -107,8 +146,14 @@ async fn main() -> Result<()> {
                 bedrock: None,
                 openai_compat: None,
             },
-            server: sashiko::settings::ServerSettings { host: "".to_string(), port: 0, read_only: true },
-            git: sashiko::settings::GitSettings { repository_path: repo_path.to_string_lossy().to_string() },
+            server: sashiko::settings::ServerSettings {
+                host: "".to_string(),
+                port: 0,
+                read_only: true,
+            },
+            git: sashiko::settings::GitSettings {
+                repository_path: repo_path.to_string_lossy().to_string(),
+            },
             review: sashiko::settings::ReviewSettings {
                 concurrency: 1,
                 worktree_dir: "review_trees".to_string(),
@@ -144,7 +189,10 @@ async fn main() -> Result<()> {
             },
         );
 
-        let git_show = worktree.get_commit_show(&squashed_sha).await.unwrap_or_default();
+        let git_show = worktree
+            .get_commit_show(&squashed_sha)
+            .await
+            .unwrap_or_default();
         let patchset_val = json!({
             "id": 1,
             "subject": format!("Squashed review of {}", args.range),
@@ -175,12 +223,6 @@ async fn main() -> Result<()> {
     .await;
 
     worktree.remove().await?;
-
-    let _ = tokio::process::Command::new("git")
-        .current_dir(&repo_path)
-        .args(["branch", "-D", &branch_name])
-        .output()
-        .await;
 
     res
 }
