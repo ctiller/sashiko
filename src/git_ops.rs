@@ -655,6 +655,77 @@ pub async fn git_checkout(repo_path: &Path, target: &str) -> Result<()> {
     }
 }
 
+pub async fn git_create_squashed_branch(
+    repo_path: &Path,
+    range: &str,
+    branch_name: &str,
+) -> Result<String> {
+    let output = tokio::process::Command::new("git")
+        .current_dir(repo_path)
+        .args(["rev-parse", "--verify", "--quiet", branch_name])
+        .output()
+        .await?;
+
+    if output.status.success() {
+        tokio::process::Command::new("git")
+            .current_dir(repo_path)
+            .args(["branch", "-D", branch_name])
+            .output()
+            .await?;
+    }
+
+    let output = tokio::process::Command::new("git")
+        .current_dir(repo_path)
+        .args([
+            "rev-parse",
+            "--verify",
+            &format!("{}^1", range.split("..").next().unwrap_or("")),
+        ])
+        .output()
+        .await;
+
+    let base = match output {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() {
+                range.split("..").next().unwrap_or("HEAD~1").to_string()
+            } else {
+                s
+            }
+        }
+        _ => range.split("..").next().unwrap_or("HEAD~1").to_string(),
+    };
+
+    tokio::process::Command::new("git")
+        .current_dir(repo_path)
+        .args(["checkout", "-b", branch_name, &base])
+        .output()
+        .await?;
+
+    let output = tokio::process::Command::new("git")
+        .current_dir(repo_path)
+        .args([
+            "merge",
+            "--squash",
+            range.split("..").nth(1).unwrap_or("HEAD"),
+        ])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        anyhow::bail!("git merge --squash failed");
+    }
+
+    tokio::process::Command::new("git")
+        .current_dir(repo_path)
+        .args(["commit", "-m", "Squashed commits"])
+        .output()
+        .await?;
+
+    let sha = get_commit_hash(repo_path, branch_name).await?;
+    Ok(sha)
+}
+
 pub async fn git_branch(repo_path: &Path) -> Result<String> {
     let output = Command::new("git")
         .current_dir(repo_path)
