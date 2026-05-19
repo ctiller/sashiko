@@ -23,7 +23,7 @@ use axum::{
     routing::{get, get_service, post},
 };
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -187,6 +187,13 @@ pub struct SubsystemQuery {
 }
 
 #[derive(Deserialize)]
+pub struct CancelQuery {
+    pub id: i64,
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Deserialize)]
 pub struct InjectRequest {
     pub raw: String,
     pub group: Option<String>,
@@ -267,15 +274,20 @@ pub async fn run_server(
         .route("/api/stats/tools", get(stats_tools))
         .route("/api/submit", post(submit_patch))
         .route("/api/patchset/rerun", post(rerun_patchset))
+        .route("/api/patchset/cancel", post(cancel_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
         .route("/", get_service(ServeFile::new("static/index.html")))
         .nest_service("/static", ServeDir::new("static"))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], settings.port));
-    info!("Web API listening on {}", addr);
+    let bind_addr = format!("{}:{}", settings.host, settings.port);
+    let addrs: Vec<SocketAddr> = bind_addr
+        .to_socket_addrs()
+        .map_err(|e| anyhow::anyhow!("invalid bind address '{}': {}", bind_addr, e))?
+        .collect();
+    info!("Web API listening on {:?}", addrs);
 
-    let listener = TcpListener::bind(addr).await?;
+    let listener = TcpListener::bind(addrs.as_slice()).await?;
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -309,7 +321,7 @@ async fn submit_patch(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    if !state.allow_all_submit && !addr.ip().is_loopback() {
+    if !state.allow_all_submit && !addr.ip().to_canonical().is_loopback() {
         info!("Refused patch submission from non-localhost: {}", addr);
         return Err(StatusCode::FORBIDDEN);
     }
@@ -914,7 +926,7 @@ async fn rerun_patchset(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    if !state.allow_all_submit && !addr.ip().is_loopback() {
+    if !state.allow_all_submit && !addr.ip().to_canonical().is_loopback() {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -931,6 +943,44 @@ async fn rerun_patchset(
     Ok(Json(serde_json::json!({ "status": "accepted" })))
 }
 
+async fn cancel_patchset(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<CancelQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if state.read_only {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    if !state.allow_all_submit && !addr.ip().is_loopback() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let cancelled = state
+        .db
+        .cancel_patchset(query.id, query.force)
+        .await
+        .map_err(|e| {
+            error!("Failed to cancel patchset {}: {}", query.id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if cancelled {
+        info!("Patchset {} cancelled (force={})", query.id, query.force);
+        Ok(Json(serde_json::json!({ "status": "cancelled" })))
+    } else {
+        let reason = if query.force {
+            "Patchset is not in a cancellable state (must be Pending, Incomplete, or In Review)"
+        } else {
+            "Patchset is not in a cancellable state (must be Pending or Incomplete; use force=true for In Review)"
+        };
+        Ok(Json(serde_json::json!({
+            "status": "not_modified",
+            "reason": reason
+        })))
+    }
+}
+
 async fn rerun_patch(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
@@ -940,7 +990,7 @@ async fn rerun_patch(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    if !state.allow_all_submit && !addr.ip().is_loopback() {
+    if !state.allow_all_submit && !addr.ip().to_canonical().is_loopback() {
         return Err(StatusCode::FORBIDDEN);
     }
 

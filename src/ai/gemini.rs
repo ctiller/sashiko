@@ -14,7 +14,8 @@
 
 use crate::ai::token_budget::TokenBudget;
 use crate::ai::{
-    AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ProviderCapabilities, ToolCall,
+    AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ClassifyAiError,
+    ProviderCapabilities, ToolCall, classify_status_code, decode_stdio_ai_response,
 };
 use crate::utils::redact_secret;
 use anyhow::{Context, Result};
@@ -24,6 +25,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::Duration;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
@@ -216,10 +218,29 @@ impl std::fmt::Display for GeminiError {
 
 impl std::error::Error for GeminiError {}
 
+impl ClassifyAiError for GeminiError {
+    fn ai_error_class(&self) -> AiErrorClass {
+        match self {
+            GeminiError::QuotaExceeded(retry_after) => AiErrorClass::RateLimit {
+                retry_after: *retry_after,
+            },
+            GeminiError::TransientError(retry_after, _) => AiErrorClass::Transient {
+                retry_after: *retry_after,
+            },
+            GeminiError::PermissionDenied(_) => AiErrorClass::Fatal,
+            GeminiError::ApiError(status, _) => {
+                classify_status_code(*status).unwrap_or(AiErrorClass::Fatal)
+            }
+            GeminiError::Other(_) => AiErrorClass::Fatal,
+        }
+    }
+}
+
 pub struct GeminiClient {
     model: String,
     base_url: String,
-    client: Client,
+    api_key: String,
+    client: RwLock<Client>,
 }
 
 impl GeminiClient {
@@ -231,23 +252,42 @@ impl GeminiClient {
             .or_else(|_| std::env::var("GEMINI_BASE_URL"))
             .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
 
-        let mut headers = reqwest::header::HeaderMap::new();
-        if !api_key.is_empty()
-            && let Ok(value) = reqwest::header::HeaderValue::from_str(&api_key)
-        {
-            headers.insert("x-goog-api-key", value);
-        }
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .timeout(Duration::from_secs(600))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let client = Self::create_http_client(&api_key);
 
         Self {
             model,
             base_url,
-            client,
+            api_key,
+            client: RwLock::new(client),
         }
+    }
+
+    fn create_http_client(api_key: &str) -> Client {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if !api_key.is_empty()
+            && let Ok(value) = reqwest::header::HeaderValue::from_str(api_key)
+        {
+            headers.insert("x-goog-api-key", value);
+        }
+
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .timeout(Duration::from_secs(600))
+            // Reliability Tuning: Prune stale connections proactively
+            .tcp_keepalive(Duration::from_secs(60))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(5)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    }
+
+    /// Replaces the internal HTTP client with a fresh one.
+    /// This is used to recover from degraded connection pools without restarting the service.
+    async fn refresh_client(&self) {
+        tracing::warn!("Refreshing Gemini HTTP client due to transport errors...");
+        let new_client = Self::create_http_client(&self.api_key);
+        let mut guard = self.client.write().await;
+        *guard = new_client;
     }
 
     pub async fn generate_content_single(
@@ -270,11 +310,16 @@ impl GeminiClient {
     ) -> Result<GenerateContentResponse> {
         let re = Regex::new(r"Please retry in ([0-9.]+)s").unwrap();
 
-        let res = match self.client.post(url).json(body).send().await {
+        let client = self.client.read().await.clone();
+        let res = match client.post(url).json(body).send().await {
             Ok(res) => res,
             Err(e) => {
                 let err_str = redact_secret(&format!("{:#}", anyhow::Error::from(e)));
                 tracing::error!("Gemini request failed (transport): {}", err_str);
+
+                // Trigger self-healing: Refresh the client for the next attempt
+                self.refresh_client().await;
+
                 return Err(GeminiError::TransientError(Duration::from_secs(30), err_str).into());
             }
         };
@@ -307,15 +352,17 @@ impl GeminiClient {
             }
         }
 
-        if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after_header = res
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.parse::<f64>().ok());
+        let status = res.status();
+        let retry_after_duration = res
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.parse::<f64>().ok());
 
-            let error_text = res.text().await?;
-            let retry_seconds = if let Some(secs) = retry_after_header {
+        let error_text = res.text().await?;
+
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_seconds = if let Some(secs) = retry_after_duration {
                 secs
             } else if let Some(caps) = re.captures(&error_text) {
                 caps[1].parse::<f64>().unwrap_or(30.0)
@@ -332,9 +379,6 @@ impl GeminiClient {
             );
         }
 
-        let status = res.status();
-        let error_text = res.text().await?;
-
         if status == reqwest::StatusCode::FORBIDDEN {
             let mut reason_str = String::new();
             if let Some(reason) = extract_gemini_error_reason(&error_text) {
@@ -350,12 +394,15 @@ impl GeminiClient {
 
         let is_transient = status.is_server_error() || status.as_u16() == 499;
         if is_transient {
+            let retry_duration = retry_after_duration
+                .map(Duration::from_secs_f64)
+                .unwrap_or(Duration::from_secs(0));
             tracing::warn!(
                 "Gemini API Transient Error: status={}, body={}",
                 status,
                 error_text
             );
-            return Err(GeminiError::TransientError(Duration::from_secs(30), error_text).into());
+            return Err(GeminiError::TransientError(retry_duration, error_text).into());
         }
 
         let mut reason_str = String::new();
@@ -427,16 +474,7 @@ impl StdioGeminiClient {
                 anyhow::bail!("Unexpected EOF from stdin waiting for AI response");
             }
 
-            let resp_msg: Value = serde_json::from_str(&line)?;
-            if resp_msg["type"] == "ai_response" {
-                let payload = serde_json::from_value(resp_msg["payload"].clone())?;
-                Ok(payload)
-            } else if resp_msg["type"] == "error" {
-                let err_msg = resp_msg["payload"].as_str().unwrap_or("Unknown error");
-                anyhow::bail!("Remote AI Error: {}", err_msg)
-            } else {
-                anyhow::bail!("Unexpected response type: {:?}", resp_msg["type"])
-            }
+            decode_stdio_ai_response(&line)
         })
         .await?
     }
@@ -693,6 +731,7 @@ fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiResponse> {
         } else {
             Some(thought)
         },
+        thought_signature: None,
         tool_calls: if tool_calls.is_empty() {
             None
         } else {
@@ -748,8 +787,70 @@ impl AiProvider for GeminiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::{AiMessage, AiResponseFormat, AiRole, AiTool, ToolCall};
+    use crate::ai::{
+        AiErrorClass, AiMessage, AiResponseFormat, AiRole, AiTool, ClassifyAiError,
+        DEFAULT_RETRY_AFTER, ToolCall,
+    };
     use serde_json::json;
+
+    #[test]
+    fn test_quota_exceeded_classifies_as_rate_limit() {
+        let retry_after = Duration::from_secs(7);
+        let err = GeminiError::QuotaExceeded(retry_after);
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::RateLimit { retry_after }
+        );
+    }
+
+    #[test]
+    fn test_transient_error_classifies_as_transient() {
+        let retry_after = Duration::from_secs(11);
+        let err = GeminiError::TransientError(retry_after, "busy".to_string());
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::Transient { retry_after }
+        );
+    }
+
+    #[test]
+    fn test_permission_denied_classifies_as_fatal() {
+        let err = GeminiError::PermissionDenied("forbidden".to_string());
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_api_error_server_status_classifies_as_transient() {
+        let err = GeminiError::ApiError(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable".to_string(),
+        );
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::Transient {
+                retry_after: DEFAULT_RETRY_AFTER,
+            }
+        );
+    }
+
+    #[test]
+    fn test_api_error_client_status_classifies_as_fatal() {
+        let err =
+            GeminiError::ApiError(reqwest::StatusCode::BAD_REQUEST, "bad request".to_string());
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_other_classifies_as_fatal() {
+        let err = GeminiError::Other("unknown".to_string());
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
 
     #[test]
     fn test_translate_ai_request_system_and_user() -> Result<()> {
@@ -760,6 +861,7 @@ mod tests {
                     role: AiRole::System,
                     content: Some("You are a helpful assistant.".to_string()),
                     thought: None,
+                    thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -767,6 +869,7 @@ mod tests {
                     role: AiRole::User,
                     content: Some("Hello!".to_string()),
                     thought: None,
+                    thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -809,6 +912,7 @@ mod tests {
                 role: AiRole::Assistant,
                 content: Some("I will use a tool.".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "call_123".to_string(),
                     function_name: "test_tool".to_string(),
@@ -898,6 +1002,7 @@ mod tests {
                 role: AiRole::Tool,
                 content: Some(json!({"result": "success"}).to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: Some("call_123".to_string()),
             }],
@@ -935,6 +1040,7 @@ mod tests {
                 role: AiRole::User,
                 content: Some("Score this.".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
             }],
@@ -967,6 +1073,7 @@ mod tests {
                     role: AiRole::User,
                     content: Some("Use tool".to_string()),
                     thought: None,
+                    thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -974,6 +1081,7 @@ mod tests {
                     role: AiRole::Assistant,
                     content: None,
                     thought: None,
+                    thought_signature: None,
                     tool_calls: Some(vec![ToolCall {
                         id: "c1".to_string(),
                         function_name: "t1".to_string(),
@@ -986,6 +1094,7 @@ mod tests {
                     role: AiRole::Tool,
                     content: Some("{\"ok\":true}".to_string()),
                     thought: None,
+                    thought_signature: None,
                     tool_calls: None,
                     tool_call_id: Some("c1".to_string()),
                 },
@@ -1035,6 +1144,7 @@ mod tests {
                     role: AiRole::User,
                     content: Some("Short message".to_string()),
                     thought: None,
+                    thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -1042,6 +1152,7 @@ mod tests {
                     role: AiRole::Assistant,
                     content: None,
                     thought: None,
+                    thought_signature: None,
                     tool_calls: Some(vec![ToolCall {
                         id: "c1".to_string(),
                         function_name: "my_function".to_string(),

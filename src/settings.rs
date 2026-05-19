@@ -153,6 +153,31 @@ fn default_prompt_caching() -> bool {
     true
 }
 
+#[cfg(feature = "vertex")]
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
+pub struct VertexSettings {
+    /// GCP project ID. Falls back to ANTHROPIC_VERTEX_PROJECT_ID env var.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// GCP region (e.g., "us-east5", "global"). Falls back to CLOUD_ML_REGION env var.
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default = "default_prompt_caching")]
+    pub prompt_caching: bool,
+    #[serde(default = "default_vertex_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default)]
+    pub thinking: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+#[cfg(feature = "vertex")]
+fn default_vertex_max_tokens() -> u32 {
+    8192
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
 pub struct OpenAiCompatSettings {
@@ -162,6 +187,34 @@ pub struct OpenAiCompatSettings {
     pub context_window_size: Option<usize>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
+pub struct KiroCliSettings {
+    #[serde(default = "default_kiro_cli_binary")]
+    pub binary: String,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default = "default_kiro_cli_context_window")]
+    pub context_window_size: usize,
+}
+
+fn default_kiro_cli_binary() -> String {
+    "kiro-cli".to_string()
+}
+
+fn default_kiro_cli_context_window() -> usize {
+    200_000
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
+pub struct ClaudeCliSettings {
+    /// Effort level passed to `claude --effort`. Valid values per Claude Code:
+    /// "low", "medium", "high", "xhigh", "max". Leave unset for the model default.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -183,12 +236,24 @@ pub struct AiSettings {
     /// Useful for debugging but verbose; disabled by default.
     #[serde(default)]
     pub log_turns: bool,
+    #[serde(default)]
+    pub response_cache: bool,
+    #[serde(default = "default_response_cache_ttl_days")]
+    pub response_cache_ttl_days: u64,
     // Provider-specific settings
     pub claude: Option<ClaudeSettings>,
     pub gemini: Option<GeminiSettings>,
     #[cfg(feature = "bedrock")]
     pub bedrock: Option<BedrockSettings>,
+    #[cfg(feature = "vertex")]
+    pub vertex: Option<VertexSettings>,
     pub openai_compat: Option<OpenAiCompatSettings>,
+    pub kiro_cli: Option<KiroCliSettings>,
+    pub claude_cli: Option<ClaudeCliSettings>,
+}
+
+fn default_response_cache_ttl_days() -> u64 {
+    7
 }
 
 fn default_api_timeout_secs() -> u64 {
@@ -214,8 +279,18 @@ pub struct ServerSettings {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
+pub struct CustomRemoteSettings {
+    pub name: String,
+    pub url: String,
+    pub check_all_branches: bool,
+    pub only_branches: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
 pub struct GitSettings {
     pub repository_path: String,
+    pub custom_remotes: Option<Vec<CustomRemoteSettings>>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -301,7 +376,7 @@ impl Settings {
             // Start with default settings
             .add_source(File::with_name("Settings"))
             // Add settings from environment variables (with a prefix of SASHIKO)
-            // e.g. SASHIKO_SERVER__PORT=8081 would set the server port
+            // e.g. SASHIKO__SERVER__PORT=8081 would set the server port
             .add_source(Environment::with_prefix("SASHIKO").separator("__"))
             .build()?;
 

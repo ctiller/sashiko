@@ -21,7 +21,7 @@ Please, note that as with any other LLM-based tools, Sashiko's output is probabi
 
 - **Automated Ingestion**: Monitors mailing lists (using `lore.kernel.org`) for new patch submissions.
 - **Manual Ingestion**: Can ingest patches from a local git repository.
-- **Self-contained**: Doesn't depend on 3rd-party tools and can work with various LLM providers (Gemini and Claude are currently supported).
+- **Self-contained**: Doesn't depend on 3rd-party tools and can work with various LLM providers (Gemini, Claude, and GitHub Copilot CLI are currently supported).
 - **Web interface and CLI**: Provides a web interface and a CLI tool. Email support will be added soon.
 
 ## Prompts
@@ -65,114 +65,210 @@ Running an automated review system like Sashiko can be computationally expensive
 - **Git**: For managing the repository and kernel tree.
 - **LLM Provider API Key**: Access to an LLM provider (e.g., Google's Gemini or Anthropic's Claude).
 
-## Setup
+## Installation
 
-1.  **Clone the repository**:
-    ```bash
-    git clone --recursive https://github.com/rgushchin/sashiko.git
-    cd sashiko
-    ```
-    *Note: The `--recursive` flag is important to initialize the `linux` kernel source submodule.*
+### From crates.io
 
-2.  **Configuration**:
-    Copy `Settings.toml` to customize your configuration. The default `Settings.toml` includes sections for:
-    *   **Database**: SQLite database path (`sashiko.db`).
-    *   **NNTP**: Server details and groups to monitor.
-    *   **AI**: Provider and model selection.
-    *   **Server**: API server host and port.
-    *   **Git**: Path to the reference kernel repository.
-    *   **Review**: Concurrency and worktree settings.
+```bash
+cargo install sashiko
+```
 
-    ### Configuring the LLM Provider
+### From source
 
-    Sashiko supports multiple LLM providers (e.g. `gemini`). You must configure the provider and model in `Settings.toml`. There are no default values, so please set them explicitly.
+#### 1.  **Clone the repository**:
+```bash
+git clone --recursive https://github.com/sashiko-dev/sashiko.git
+cd sashiko
+```
+*Note: The `--recursive` flag is important to initialize the `linux` kernel source submodule.*
 
-    Example `Settings.toml` configuration for Gemini:
+#### 2.  **Configuration**:
+Copy `Settings.toml` to customize your configuration. The default `Settings.toml` includes sections for:
+*   **Database**: SQLite database path (`sashiko.db`).
+*   **NNTP**: Server details and groups to monitor.
+*   **AI**: Provider and model selection.
+*   **Server**: API server host and port.
+*   **Git**: Path to the reference kernel repository.
+*   **Review**: Concurrency and worktree settings.
 
-    ```toml
-    [ai]
-    provider = "gemini"
-    model = "gemini-3.1-pro-preview"
-    # Optional settings
-    # max_input_tokens = 950000
-    # temperature = 1.0
-    ```
+#### Configuring the LLM Provider
 
-    You can also configure settings via environment variables using the `SASHIKO` prefix and double underscores for nesting (e.g., `SASHIKO_AI__PROVIDER=gemini`).
+Sashiko supports multiple LLM providers (e.g. `gemini`). You must configure the provider and model in `Settings.toml`. There are no default values, so please set them explicitly.
 
-    **Important**: You must set the `LLM_API_KEY` environment variable with your provider's API key.
-    ```bash
-    export LLM_API_KEY="your_api_key_here"
-    ```
+For example configurations of each supported provider, see the `examples/` directory.
 
-    ### Claude Setup
+You can copy the base Gemini configuration like so:
 
-    Sashiko supports Anthropic's Claude models via the Claude API.
+```bash
+cp examples/Settings.example.toml Settings.toml
+```
 
-    **Get an API key**: https://console.anthropic.com/
+You can also configure settings via environment variables using the `SASHIKO` prefix and `__` (double underscore) as the separator between every segment (e.g., `SASHIKO__AI__PROVIDER=gemini`).
 
-    **Configure environment**:
-    ```bash
-    export ANTHROPIC_API_KEY="sk-ant-..."
-    # Or use the generic key (LLM_API_KEY serves as fallback):
-    export LLM_API_KEY="sk-ant-..."
-    ```
+**Important**: You must set the `LLM_API_KEY` environment variable with your provider's API key.
+```bash
+export LLM_API_KEY="your_api_key_here"
+```
 
-    **Update Settings.toml**:
-    ```toml
-    [ai]
-    provider = "claude"
-    model = "claude-sonnet-4-6"
-    max_input_tokens = 950000
+#### Claude Setup
 
-    [ai.claude]
-    prompt_caching = true
-    ```
+Sashiko supports Anthropic's Claude models via the Claude API.
 
-    **Features**:
-    - Automatic prompt caching (5-minute TTL) reduces costs for repeated context
-    - Full tool/function calling support for git operations
-    - Automatic retry logic for rate limits and API overload
-    - 1M context window for claude-sonnet-4-6 (use max_input_tokens = 950000 for safety margin)
+**Get an API key**: https://console.anthropic.com/
 
-    ### AWS Bedrock Setup
+**Configure environment**:
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+# Or use the generic key (LLM_API_KEY serves as fallback):
+export LLM_API_KEY="sk-ant-..."
+```
 
-    Sashiko supports AWS Bedrock via the Converse API, which works with any Bedrock-hosted model (Claude, Llama, Mistral, etc.).
+**Update Settings.toml**:
+Copy `examples/Settings.claude.toml` to your `Settings.toml` and adjust as needed.
 
-    **Prerequisites**: Enable model access in the [AWS Bedrock console](https://console.aws.amazon.com/bedrock/) for your desired model and region.
+**Features**:
+- Automatic prompt caching (5-minute TTL) reduces costs for repeated context
+- Full tool/function calling support for git operations
+- Automatic retry logic for rate limits and API overload
+- 200K context window for Claude models (use max_input_tokens = 40000 for cost-conscious defaults)
+- Extended thinking support via `thinking` and `effort` settings
 
-    **Configure AWS credentials** using any standard method:
-    ```bash
-    # Option 1: Environment variables
-    export AWS_ACCESS_KEY_ID="..."
-    export AWS_SECRET_ACCESS_KEY="..."
-    export AWS_REGION="us-east-1"
+#### Claude Code CLI Setup
 
-    # Option 2: AWS CLI profile (~/.aws/credentials)
-    aws configure
-    ```
+Sashiko can use a local [Claude Code](https://claude.com/claude-code) install as
+a completion backend. This path uses your Claude Code subscription, so there is
+no per-token API charge and no API key to configure.
 
-    **Update Settings.toml**:
-    ```toml
-    [ai]
-    provider = "bedrock"
-    model = "us.anthropic.claude-sonnet-4-6-20250514-v1:0"
-    max_input_tokens = 950000
+**Prerequisites**: Install Claude Code and sign in. Verify with `claude --version`.
 
-    [ai.bedrock]
-    region = "us-east-1"  # Optional, falls back to AWS SDK defaults
-    ```
+**Update Settings.toml**:
+Copy `examples/Settings.claude-cli.toml` to your `Settings.toml` and adjust as needed.
 
-    **Features**:
-    - Uses the Converse API — works with any Bedrock-hosted model
-    - No API key needed — uses standard AWS IAM authentication
-    - Supports cross-region inference profiles (e.g., `us.anthropic.claude-*`)
-    - Full tool/function calling support for git operations
+`model` accepts any identifier the CLI accepts via `--model`: aliases like
+`opus` or `sonnet`, or full names like `claude-opus-4-7`, `claude-sonnet-4-6`.
 
-3.  **Build**:
-    ```bash
-    cargo build --release
-    ```
+Context window notes:
+- `claude-opus-4-7` gives you 1M tokens by default.
+- `claude-sonnet-4-6` and `claude-opus-4-6` have 1M capability per Anthropic's
+  docs, but the CLI defaults them to 200K. Append the `[1m]` suffix
+  (e.g. `claude-sonnet-4-6[1m]`) to opt into the 1M variant.
+- `claude-haiku-4-5` is 200K only; there is no 1M variant.
+- The CLI rejects pre-thinking models (Claude 3.x family) with HTTP 404.
+
+**Features**:
+- No API key needed. Uses Claude Code's subscription auth.
+- Stateless: spawns `claude --print --output-format json --no-session-persistence`
+  per request. No tool access, no file access, no session reuse.
+- Prompt caching is handled by Claude Code automatically.
+- `effort` is forwarded to `claude --effort` and controls the model's thinking
+  budget. The exact mode depends on the model: Opus 4.7 uses adaptive
+  thinking, Sonnet 4.6 and Haiku 4.5 use extended thinking. The CLI exposes
+  one knob (effort) for both; if you need to pick the mode explicitly or
+  disable thinking, use `provider = "claude"` (API) instead.
+- `[ai.claude]` settings (`prompt_caching`, `thinking`, etc.) are read only by
+  the API provider above. They are ignored on this path.
+
+**Notes**: Each review may spawn many CLI processes. Lower `review.concurrency`
+if you hit subscription rate limits.
+
+#### GitHub Copilot CLI Setup
+
+Sashiko can use a local [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli)
+install as a completion backend. This path uses your GitHub Copilot
+subscription, so there is no per-token API charge and no API key to configure.
+
+**Prerequisites**:
+- `copilot` CLI installed and on `$PATH`
+- Authenticated session (run `copilot` once interactively to authenticate)
+
+**Update Settings.toml**:
+Copy `examples/Settings.copilot-cli.toml` to your `Settings.toml` and adjust as needed.
+
+**Notes**:
+- `model` follows GitHub Copilot's catalog (e.g. `claude-sonnet-4.5`,
+  `gpt-5.5`); pick a model your subscription has access to.
+- Sashiko invokes `copilot` with `--disable-builtin-mcps`,
+  `--no-custom-instructions`, and `--allow-all-tools` so the provider is used
+  as a text-completion-with-tools backend only — no MCP servers, no
+  `AGENTS.md`.
+- The prompt is sent via stdin (not `-p <argv>`) to avoid Linux's
+  `MAX_ARG_STRLEN` cap (~128 KB per argv element).
+- `max_interactions` controls how many tool-call rounds the provider permits
+  before aborting, the same as `claude-cli`.
+- Each review may spawn many `copilot` processes. Lower `review.concurrency`
+  if you hit subscription rate limits.
+
+#### AWS Bedrock Setup
+
+Sashiko supports AWS Bedrock via the Converse API, which works with any Bedrock-hosted model (Claude, Llama, Mistral, etc.).
+
+**Prerequisites**: Enable model access in the [AWS Bedrock console](https://console.aws.amazon.com/bedrock/) for your desired model and region.
+
+**Configure AWS credentials** using any standard method:
+```bash
+# Option 1: Environment variables
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="us-east-1"
+
+# Option 2: AWS CLI profile (~/.aws/credentials)
+aws configure
+```
+
+**Update Settings.toml**:
+Copy `examples/Settings.claude-bedrock.toml` to your `Settings.toml` and adjust as needed.
+
+**Features**:
+- Uses the Converse API — works with any Bedrock-hosted model
+- No API key needed — uses standard AWS IAM authentication
+- Supports cross-region inference profiles (e.g., `us.anthropic.claude-*`)
+- Full tool/function calling support for git operations
+
+#### Google Cloud Vertex AI Setup
+
+Sashiko supports Google Cloud Vertex AI, which provides access to Claude models (and potentially other model families) via Google Cloud infrastructure. Build with `--features vertex`.
+
+**Prerequisites**: Enable the Vertex AI API and model access in the [Vertex AI Model Garden](https://cloud.google.com/model-garden) for your desired model and region.
+
+**Configure GCP credentials**:
+```bash
+gcloud auth application-default login
+```
+
+**Configure environment**:
+```bash
+export ANTHROPIC_VERTEX_PROJECT_ID="my-gcp-project"
+export CLOUD_ML_REGION="us-east5"  # or "global" for global endpoints
+```
+
+**Update Settings.toml**:
+Copy `examples/Settings.claude-vertex.toml` to your `Settings.toml` and adjust as needed.
+
+**Features**:
+- Model-agnostic routing layer — currently supports Claude, extensible to other model families
+- No API key needed — uses Google Cloud Application Default Credentials (ADC)
+- Supports global, multi-region, and regional endpoints
+- 1M context window for Claude Opus 4.7/4.6 and Sonnet 4.6 on Vertex
+- Full tool/function calling and prompt caching support
+
+#### Kiro CLI Setup
+
+Sashiko supports using the local `kiro-cli` as a completion backend.
+
+**Prerequisites**: Install `kiro-cli` and authenticate with `KIRO_API_KEY` or a browser login.
+
+**Update Settings.toml**:
+Copy `examples/Settings.kiro-cli.toml` to your `Settings.toml` and adjust as needed.
+
+**Features**:
+- Runs `kiro-cli acp` as a stateless completion backend
+- Kiro native tools are disabled by default; Sashiko's own tool protocol is used instead
+- An isolated temporary agent with a deny-all hook prevents accidental tool execution
+
+#### 3.  **Build**:
+```bash
+cargo build --release
+```
 
 ## Usage
 
@@ -185,10 +281,10 @@ The daemon is responsible for monitoring mailing lists, managing the database, a
 To start the daemon:
 
 ```bash
-cargo run
+sashiko
 ```
 
-(Or via Nix: `nix run github:sashiko-dev/sashiko`)
+(Or from source: `cargo run`, or via Nix: `nix run github:sashiko-dev/sashiko`)
 
 ### 2. CLI
 
@@ -197,11 +293,18 @@ The CLI allows you to interact with the running Sashiko daemon from your termina
 To run the CLI:
 
 ```bash
-cargo run --bin sashiko-cli -- [COMMAND]
+sashiko-cli [OPTIONS] [COMMAND]
 ```
 
-(Or via Nix: Install `github:sashiko-dev/sashiko`, e.g. via `nix profile add`,
-then run `sashiko-cli [COMMAND]`)
+(Or from source: `cargo run --bin sashiko-cli -- [OPTIONS] [COMMAND]`,
+or via Nix: `nix profile add github:sashiko-dev/sashiko`)
+
+**Global Options:**
+
+- **`--server <SERVER>`**: Override the server URL.
+- **`--format <FORMAT>`**: Switch between text and json output.
+- **`--color <COLOR>`**: Control color output (`auto`, `always`, `never`).
+- **`-V, --version`**: Print the tool version.
 
 **Commands:**
 
@@ -214,6 +317,10 @@ then run `sashiko-cli [COMMAND]`)
   - `FILTER` can be a status (e.g., `pending`, `failed`, `reviewed`) or a search term.
 - **`show [ID]`**: Show detailed information about a patchset and its AI review.
   - `ID` defaults to `latest`.
+- **`rerun`**: Request a re-review of a completed patchset.
+- **`cancel`**: Cancel a pending review.
+- **`local`**: Run a local review.
+- **`help`**: Print help messages.
 
 ### 3. Getting Sashiko to Review Your Kernel Patch Series Locally
 
@@ -263,7 +370,7 @@ To evaluate the AI's review performance against a set of known issues, follow th
 We welcome contributions and feedback through two main channels:
 
 *   **GitHub:** Feel free to use GitHub issues for bug reports and feature requests, and submit Pull Requests for code changes.
-*   **Mailing List:** Join us at `sashiko@lists.linux.dev` (archived at [lore.kernel.org](https://lore.kernel.org/sashiko)) for Sashiko-related announcements and broader AI-review discussions, including general feedback, architectural ideas, and specific prompt discussions.
+*   **Mailing List:** Join us at `sashiko@lists.linux.dev` (archived at [lore.kernel.org](https://lore.kernel.org/sashiko)) for Sashiko-related announcements and broader AI-review discussions, including general feedback, architectural ideas, and specific prompt discussions. Automated patch reviews are sent from and should be replied to `sashiko-reviews@lists.linux.dev`.
 
 ## Contributing
 
@@ -281,6 +388,25 @@ This project was built using Gemini CLI. If you're using other development agent
 Please, make sure your code is working before sending PR. Make sure it can be built without warnings, all tests pass, run cargo fmt and clippy.
 If you're changing AI-related parts, please, run at least several code reviews.
 Development got much faster these days, but testing is as important as ever.
+
+### Gemini CLI Skills
+
+For users of the [Gemini CLI](https://github.com/google/gemini-cli), we provide specialized skills to automate development workflows:
+
+- **`review-pr`**: Performs deep, scrutinizing code reviews against `GEMINI.md` and design documents. Detects relevant design files automatically and generates categorized findings with ready-to-paste diffs.
+- **`sashiko-feature`**: A meta-skill for implementing new features. It handles design document matching, codebase investigation, and ensures adherence to SOLID/DRY principles in Rust, while iteratively running `make` checks.
+
+#### Installing Skills
+
+To install these skills in your local workspace:
+
+```bash
+gemini skills install ./skills/review-pr.skill --scope workspace
+gemini skills install ./skills/sashiko-feature.skill --scope workspace
+/skills reload
+```
+
+For users of other agent interfaces (e.g., OpenCode, Claude Code), we recommend following your interface's specific settings to symlink or copy the skill configurations (the `SKILL.md` and `references/` files) into your agent's custom instruction path.
 
 ## License
 

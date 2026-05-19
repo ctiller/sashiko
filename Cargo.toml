@@ -1,12 +1,34 @@
 [package]
 name = "sashiko"
-version = "0.1.4"
+version = "0.1.7"
 edition = "2024"
 default-run = "sashiko"
+description = "Agentic code review system for Linux kernel"
+license = "Apache-2.0"
+repository = "https://github.com/sashiko-dev/sashiko"
+homepage = "https://sashiko.dev"
+readme = "README.md"
+keywords = ["linux", "kernel", "code-review", "ai", "llm"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    "third_party/linux/",
+    "llama.cpp/",
+    "archives/",
+    "review_trees/",
+    "sashiko.dev/",
+    "designs/",
+    ".sashiko*",
+    "*.log",
+    "*.txt",
+    "*.pid",
+    "install.sh",
+    "test_*.rs",
+]
 
 [features]
 default = ["bedrock"]
 bedrock = ["aws-config", "aws-sdk-bedrockruntime", "aws-smithy-types"]
+vertex = ["google-cloud-auth"]
 
 [dependencies]
 anyhow = "1.0.100"
@@ -18,6 +40,7 @@ axum = "0.8.8"
 chrono = "0.4.43"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 config = "0.15.19"
+google-cloud-auth = { version = "1.10", optional = true }
 fastrand = "2.3.0"
 flate2 = "1.1.9"
 futures = "0.3.31"
@@ -26,7 +49,7 @@ grep-matcher = "0.1.8"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.16"
 ignore = "0.4.25"
-lettre = { version = "0.11.7", features = ["tokio1", "tokio1-native-tls"] }
+lettre = { version = "0.11.7", default-features = false, features = ["builder", "hostname", "pool", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
 libsql = "0.9.29"
 mail-parser = "0.11.1"
 regex = "1.12.2"

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::settings::CustomRemoteSettings;
 use anyhow::Result;
 use regex::Regex;
 use std::collections::HashMap;
@@ -55,10 +56,15 @@ impl BaselineResolution {
 pub struct BaselineRegistry {
     entries: Vec<MaintainersEntry>,
     remote_map: HashMap<String, String>, // URL -> Local Remote Name
+    pub custom_remotes: Option<Vec<CustomRemoteSettings>>,
+    pub repo_path: std::path::PathBuf,
 }
 
 impl BaselineRegistry {
-    pub fn new(repo_path: &Path) -> Result<Self> {
+    pub fn new(
+        repo_path: &Path,
+        custom_remotes: Option<Vec<CustomRemoteSettings>>,
+    ) -> Result<Self> {
         let remote_map = Self::load_git_remotes(repo_path).unwrap_or_default();
 
         // Identify Linus's tree
@@ -104,6 +110,8 @@ impl BaselineRegistry {
         Ok(Self {
             entries,
             remote_map,
+            custom_remotes,
+            repo_path: repo_path.to_path_buf(),
         })
     }
 
@@ -214,7 +222,7 @@ impl BaselineRegistry {
         Ok(map)
     }
 
-    pub fn resolve_candidates(
+    pub async fn resolve_candidates(
         &self,
         files: &[String],
         subject: &str,
@@ -259,6 +267,53 @@ impl BaselineRegistry {
         // Or if we can find 'torvalds/linux.git' in remote map.
         // For simplicity: HEAD.
         candidates.push(BaselineResolution::LocalRef("HEAD".to_string()));
+
+        // 5. Custom Remotes
+        if let Some(custom_remotes) = &self.custom_remotes {
+            for remote in custom_remotes {
+                // Fetch to ensure we have the latest branches (Issue 1)
+                if let Err(e) =
+                    crate::git_ops::ensure_remote(&self.repo_path, &remote.name, &remote.url, false)
+                        .await
+                {
+                    warn!(
+                        "Failed to ensure custom remote {}: {}. Using local branches.",
+                        remote.name, e
+                    );
+                }
+
+                if remote.check_all_branches {
+                    match crate::git_ops::get_remote_branches(&self.repo_path, &remote.name).await {
+                        Ok(branches) => {
+                            for branch in branches {
+                                candidates.push(BaselineResolution::RemoteTarget {
+                                    url: remote.url.clone(),
+                                    name: remote.name.clone(),
+                                    branch: Some(branch),
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to get remote branches for {}: {}. Continuing.",
+                                remote.name, e
+                            );
+                        }
+                    }
+                }
+
+                // Change else if to if (Issue 3)
+                if let Some(branches) = &remote.only_branches {
+                    for branch in branches {
+                        candidates.push(BaselineResolution::RemoteTarget {
+                            url: remote.url.clone(),
+                            name: remote.name.clone(),
+                            branch: Some(branch.clone()),
+                        });
+                    }
+                }
+            }
+        }
 
         // Deduplicate
         // Simple deduplication based on string representation or enum equality
@@ -430,7 +485,7 @@ impl BaselineRegistry {
         }
 
         // Sort descending by score
-        scored_candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        scored_candidates.sort_by_key(|b| std::cmp::Reverse(b.0));
 
         let mut unique_filtered = Vec::new();
         for (_, res) in scored_candidates {
@@ -517,16 +572,20 @@ mod tests {
         BaselineRegistry {
             entries,
             remote_map,
+            custom_remotes: None,
+            repo_path: std::path::PathBuf::from("."),
         }
     }
 
-    #[test]
-    fn test_resolve_candidates() {
+    #[tokio::test]
+    async fn test_resolve_candidates() {
         let registry = create_registry();
         let files = vec!["net/core.c".to_string()];
         let body = "Some text\nbase-commit: 1234567890123456789012345678901234567890\n";
 
-        let candidates = registry.resolve_candidates(&files, "Subject", Some(body));
+        let candidates = registry
+            .resolve_candidates(&files, "Subject", Some(body))
+            .await;
 
         assert_eq!(candidates.len(), 4); // Base, Subsystem, Next, Head
 
@@ -558,8 +617,8 @@ F: patterns/
         assert_eq!(entries[0].trees[0].1, Some("branch".to_string()));
     }
 
-    #[test]
-    fn test_resolve_linux_mm() {
+    #[tokio::test]
+    async fn test_resolve_linux_mm() {
         let entries = vec![MaintainersEntry {
             subsystem: "MEMORY MANAGEMENT".to_string(),
             trees: vec![(
@@ -577,10 +636,12 @@ F: patterns/
         let registry = BaselineRegistry {
             entries,
             remote_map,
+            custom_remotes: None,
+            repo_path: std::path::PathBuf::from("."),
         };
 
         let files = vec!["mm/memory.c".to_string()];
-        let candidates = registry.resolve_candidates(&files, "Subject", None);
+        let candidates = registry.resolve_candidates(&files, "Subject", None).await;
 
         // Expected order:
         // 1. mm-new (Subsystem Heuristic 1)
@@ -612,8 +673,8 @@ F: patterns/
         }
     }
 
-    #[test]
-    fn test_resolve_multiple_trees() {
+    #[tokio::test]
+    async fn test_resolve_multiple_trees() {
         let entries = vec![MaintainersEntry {
             subsystem: "PERFORMANCE EVENTS SUBSYSTEM".to_string(),
             trees: vec![
@@ -642,10 +703,12 @@ F: patterns/
         let registry = BaselineRegistry {
             entries,
             remote_map,
+            custom_remotes: None,
+            repo_path: std::path::PathBuf::from("."),
         };
 
         let files = vec!["tools/perf/builtin-report.c".to_string()];
-        let candidates = registry.resolve_candidates(&files, "Subject", None);
+        let candidates = registry.resolve_candidates(&files, "Subject", None).await;
 
         // Current implementation likely only returns ONE of the trees (arbitrarily or first)
         // plus linux-next and HEAD.
@@ -668,8 +731,8 @@ F: patterns/
         );
     }
 
-    #[test]
-    fn test_resolve_next_prioritization() {
+    #[tokio::test]
+    async fn test_resolve_next_prioritization() {
         let entries = vec![MaintainersEntry {
             subsystem: "NETWORKING".to_string(),
             trees: vec![
@@ -685,13 +748,16 @@ F: patterns/
         let registry = BaselineRegistry {
             entries,
             remote_map,
+            custom_remotes: None,
+            repo_path: std::path::PathBuf::from("."),
         };
 
         let files = vec!["net/core.c".to_string()];
 
         // With "next" in subject
-        let candidates_next =
-            registry.resolve_candidates(&files, "[PATCH net-next] something", None);
+        let candidates_next = registry
+            .resolve_candidates(&files, "[PATCH net-next] something", None)
+            .await;
         let names_next: Vec<String> = candidates_next
             .iter()
             .filter_map(|c| match c {
@@ -706,7 +772,9 @@ F: patterns/
         assert!(pos_net_next < pos_net);
 
         // Without "next" in subject
-        let candidates_nonext = registry.resolve_candidates(&files, "[PATCH net] something", None);
+        let candidates_nonext = registry
+            .resolve_candidates(&files, "[PATCH net] something", None)
+            .await;
         let names_nonext: Vec<String> = candidates_nonext
             .iter()
             .filter_map(|c| match c {
@@ -719,5 +787,47 @@ F: patterns/
         let pos_net_nonext = names_nonext.iter().position(|x| x == "net").unwrap();
         let pos_net_next_nonext = names_nonext.iter().position(|x| x == "net-next").unwrap();
         assert!(pos_net_nonext < pos_net_next_nonext);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_custom_remotes() {
+        use crate::settings::CustomRemoteSettings;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path();
+
+        // Init git repo to avoid ensure_remote failing too hard
+        std::process::Command::new("git")
+            .current_dir(repo_path)
+            .arg("init")
+            .output()
+            .unwrap();
+
+        let mut remote_map = HashMap::new();
+        let dummy_url = repo_path.join("dummy_remote").to_str().unwrap().to_string();
+        remote_map.insert(dummy_url.clone(), "dummy-repo".to_string());
+
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map,
+            custom_remotes: Some(vec![CustomRemoteSettings {
+                name: "dummy-repo".to_string(),
+                url: dummy_url,
+                check_all_branches: false,
+                only_branches: Some(vec!["master".to_string()]),
+            }]),
+            repo_path: repo_path.to_path_buf(),
+        };
+
+        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+
+        let candidate_names: Vec<String> = candidates
+            .iter()
+            .filter_map(|c| match c {
+                BaselineResolution::RemoteTarget { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(candidate_names.contains(&"dummy-repo".to_string()));
     }
 }

@@ -1632,13 +1632,41 @@ impl Database {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT id, date, author, subject, subject_index, total_parts FROM patchsets WHERE cover_letter_message_id = ?",
+                    "SELECT id, date, author, subject, subject_index, total_parts, status FROM patchsets WHERE cover_letter_message_id = ?",
                     libsql::params![clid.clone()],
                 )
                 .await?;
-            if let Ok(Some(row)) = rows.next().await {
-                // Found it! Use this ID. We'll update its fields below.
+            while let Ok(Some(row)) = rows.next().await {
                 let id: i64 = row.get(0)?;
+                let existing_subject: String = row.get(3)?;
+                let existing_status: String = row.get(6).unwrap_or_else(|_| "Unknown".to_string());
+
+                let is_placeholder =
+                    existing_subject == "(placeholder)" || existing_status == "Fetching";
+
+                let existing_version = crate::patch::parse_subject_version(&existing_subject);
+                let v_new = version.unwrap_or(1);
+                let v_old = existing_version.unwrap_or(1);
+                let versions_compatible = v_new == v_old;
+
+                let index_collision = if part_index == 0 {
+                    false
+                } else {
+                    let mut p_rows = self
+                        .conn
+                        .query(
+                            "SELECT 1 FROM patches WHERE patchset_id = ? AND part_index = ? AND message_id != ?",
+                            libsql::params![id, part_index, message_id],
+                        )
+                        .await?;
+                    p_rows.next().await.ok().flatten().is_some()
+                };
+
+                if index_collision || (!is_placeholder && !versions_compatible) {
+                    continue;
+                }
+
+                // Found it! Use this ID. We'll update its fields below.
                 let subject_index: u32 = row.get(4).unwrap_or(9999);
                 let existing_total: u32 = row.get(5).unwrap_or(1);
 
@@ -1776,6 +1804,28 @@ impl Database {
                 p_rows.next().await.ok().flatten().is_some()
             };
 
+            let mut existing_msgid_prefix = None;
+            if let Some(ref cover_id) = existing_cover_id {
+                existing_msgid_prefix =
+                    Some(cover_id.split('-').next().unwrap_or(cover_id).to_string());
+            } else {
+                let mut p_rows = self
+                    .conn
+                    .query(
+                        "SELECT message_id FROM patches WHERE patchset_id = ? LIMIT 1",
+                        libsql::params![id],
+                    )
+                    .await?;
+                if let Ok(Some(p_row)) = p_rows.next().await {
+                    let pid: String = p_row.get(0)?;
+                    existing_msgid_prefix = Some(pid.split('-').next().unwrap_or(&pid).to_string());
+                }
+            }
+
+            let new_msgid_prefix = message_id.split('-').next().unwrap_or(message_id);
+            let msgid_prefix_match = existing_msgid_prefix.as_deref() == Some(new_msgid_prefix)
+                && new_msgid_prefix.len() > 10;
+
             // Matching logic:
             // 1. Author matches OR it's a multi-part series with matching total_parts (trusting thread context)
             //    BUT strict_author enforces strict author matching (for Email/NNTP).
@@ -1839,8 +1889,9 @@ impl Database {
             };
 
             // Thread Enforcement: To prevent cross-thread "stealing" of patches for resends of the same series,
-            // we strictly require multi-part series patches to belong to the same thread.
-            let thread_compatible = same_thread || is_singleton;
+            // we strictly require multi-part series patches to belong to the same thread,
+            // unless they share a git send-email Message-ID prefix indicating they were sent together unthreaded.
+            let thread_compatible = same_thread || is_singleton || msgid_prefix_match;
 
             if author_or_series_match
                 && (!strict_author || (date - existing_date).abs() < 86400)
@@ -2013,6 +2064,26 @@ impl Database {
         part_index: u32,
         diff: &str,
     ) -> Result<i64> {
+        // Check if index collision occurs for this patchset
+        let collision_exists: bool = {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM patches WHERE patchset_id = ? AND part_index = ? AND message_id != ?",
+                    libsql::params![patchset_id, part_index, message_id],
+                )
+                .await?;
+            rows.next().await.ok().flatten().is_some()
+        };
+
+        if collision_exists {
+            return Err(anyhow::anyhow!(
+                "Index collision: index {} already exists in patchset {}",
+                part_index,
+                patchset_id
+            ));
+        }
+
         // Check if patch exists and get old patchset_id to fix counts if we steal it
         let old_patchset_id: Option<i64> = {
             let mut rows = self
@@ -3205,9 +3276,34 @@ impl Database {
         Ok(())
     }
 
+    pub async fn get_patchset_status(&self, id: i64) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT status FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn cancel_patchset(&self, id: i64, force: bool) -> Result<bool> {
+        let query = if force {
+            "UPDATE patchsets SET status = 'Cancelled' WHERE id = ? AND status IN ('Pending', 'Incomplete', 'In Review')"
+        } else {
+            "UPDATE patchsets SET status = 'Cancelled' WHERE id = ? AND status IN ('Pending', 'Incomplete')"
+        };
+        let count = self.conn.execute(query, libsql::params![id]).await?;
+        Ok(count > 0)
+    }
+
     pub async fn restart_failed_reviews(&self) -> Result<u64> {
         let count = self.conn.execute(
-            "UPDATE patchsets SET status = 'Pending', failed_reason = NULL WHERE status = 'Failed'",
+            "UPDATE patchsets SET status = 'Pending', failed_reason = NULL WHERE status IN ('Failed', 'Failed To Apply')",
             libsql::params![],
         ).await?;
         Ok(count)

@@ -23,21 +23,33 @@ ignored_emails = ["patchwork@emeril.freedesktop.org"]
 lists = ["linux-hwmon@vger.kernel.org"]
 reply_to_author = true
 cc = ["linux-hwmon@vger.kernel.org"]
+send_positive_review = true
 
 [subsystems.perf]
 lists = ["linux-perf-users@vger.kernel.org"]
 reply_to_author = true
 cc = ["linux-perf-users@vger.kernel.org"]
 
+[subsystems.batman]
+lists = ["b.a.t.m.a.n@lists.open-mesh.org"]
+cc = ["marek.lindner@mailbox.org", "sw@simonwunderlich.de", "antonio@mandelbit.com", "sven@narfation.org"]
+
 [subsystems.bpf]
 lists = ["bpf@vger.kernel.org"]
 reply_to_author = true
 cc = ["bpf@vger.kernel.org"]
+embargo_hours = 0
+subject_prefixes = ["bpf", "bpf-next"]
 
 [subsystems.damon]
 lists = ["damon@lists.linux.dev"]
 reply_to_author = true
 cc = ["damon@lists.linux.dev"]
+
+[subsystems.devicetree]
+lists = ["devicetree@vger.kernel.org"]
+reply_to_author = true
+cc = ["robh@kernel.org", "conor+dt@kernel.org", "devicetree@vger.kernel.org"]
 
 [subsystems.ext4]
 lists = ["linux-ext4@vger.kernel.org"]
@@ -47,6 +59,7 @@ cc = ["tytso@mit.edu"]
 [subsystems.net]
 lists = ["netdev@vger.kernel.org"]
 embargo_hours = 24
+subject_prefixes = ["net", "net-next"]
 
 [subsystems.cgroups]
 lists = ["cgroups@vger.kernel.org"]
@@ -61,3 +74,66 @@ cc = ["wsa+renesas@sang-engineering.com"]
 lists = ["rust-for-linux@vger.kernel.org"]
 reply_to_author = true
 cc = ["ojeda@kernel.org"]
+
+[subsystems.sched-ext]
+lists = ["sched-ext@lists.linux.dev"]
+reply_to_author = true
+cc = ["sched-ext@lists.linux.dev"]
+
+[subsystems.openvpn-devel]
+lists = ["openvpn-devel@lists.sourceforge.net"]
+cc = ["antonio@mandelbit.com", "ralf@mandelbit.com", "sd@queasysnail.net"]
+
+[subsystems.live-patching]
+lists = ["live-patching@vger.kernel.org"]
+reply_all = true
+
+[subsystems.pci]
+lists = ["linux-pci@vger.kernel.org"]
+reply_to_author = true
+cc = ["linux-pci@vger.kernel.org"]
+
+[subsystems.watchdog]
+lists = ["linux-watchdog@vger.kernel.org"]
+reply_to_author = true
+cc = ["linux-watchdog@vger.kernel.org"]
+
+[subsystems.linux-ide]
+lists = ["linux-ide@vger.kernel.org"]
+reply_to_author = true
+cc = ["dlemoal@kernel.org", "cassel@kernel.org", "linux-ide@vger.kernel.org"]
+
+[subsystems.linux-input]
+lists = ["linux-input@vger.kernel.org"]
+reply_to_author = true
+cc = ["dmitry.torokhov@gmail.com", "linux-input@vger.kernel.org"]
+
+[subsystems.dmaengine]
+lists = ["dmaengine@vger.kernel.org"]
+reply_to_author = true
+cc = ["vkoul@kernel.org", "Frank.Li@kernel.org", "dmaengine@vger.kernel.org"]
+
+[subsystems.linux-phy]
+lists = ["linux-phy@lists.infradead.org"]
+reply_to_author = true
+cc = ["vkoul@kernel.org", "neil.armstrong@linaro.org", "olteanv@gmail.com", "linux-phy@lists.infradead.org"]
+
+[subsystems.imx]
+lists = ["imx@lists.linux.dev"]
+reply_to_author = true
+cc = ["Frank.Li@kernel.org", "imx@lists.linux.dev"]
+
+[subsystems.linux-sunxi]
+lists = ["linux-sunxi@lists.linux.dev"]
+reply_to_author = true
+cc = ["linux-sunxi@lists.linux.dev"]
+
+[subsystems.linux-amlogic]
+lists = ["linux-amlogic@lists.infradead.org"]
+reply_to_author = true
+cc = ["neil.armstrong@linaro.org", "linux-amlogic@lists.infradead.org"]
+
+[subsystems.linux-hyperv]
+lists = ["linux-hyperv@vger.kernel.org"]
+reply_to_author = true
+cc = ["linux-hyperv@vger.kernel.org"]

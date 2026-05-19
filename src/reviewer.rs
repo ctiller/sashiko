@@ -14,7 +14,10 @@
 
 use crate::ReviewStatus;
 use crate::ai::quota::QuotaManager;
-use crate::ai::{AiProvider, AiRequest, create_provider};
+use crate::ai::{
+    AiErrorClass, AiProvider, AiRequest, RemoteAiErrorPayload, classify_ai_error,
+    create_provider_cached,
+};
 use crate::baseline::{BaselineRegistry, BaselineResolution, extract_files_from_diff};
 use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity, ToolUsage};
 use crate::email_policy::EmailPolicyConfig;
@@ -90,28 +93,35 @@ impl Reviewer {
     ///
     /// * `db` - The database connection.
     /// * `settings` - Application settings.
-    pub fn new(db: Arc<Database>, settings: Settings) -> Self {
+    pub async fn new(db: Arc<Database>, settings: Settings) -> Self {
         let concurrency = settings.review.concurrency;
         let repo_path = PathBuf::from(&settings.git.repository_path);
 
-        let baseline_registry = match BaselineRegistry::new(&repo_path) {
-            Ok(r) => Arc::new(r),
-            Err(e) => {
-                error!(
-                    "Failed to initialize BaselineRegistry: {}. Using empty registry.",
-                    e
-                );
-                Arc::new(BaselineRegistry::new(&repo_path).unwrap_or_else(|_| {
-                    panic!("Critical error initializing BaselineRegistry: {}", e)
-                }))
-            }
-        };
+        let baseline_registry =
+            match BaselineRegistry::new(&repo_path, settings.git.custom_remotes.clone()) {
+                Ok(r) => Arc::new(r),
+                Err(e) => {
+                    error!(
+                        "Failed to initialize BaselineRegistry: {}. Using empty registry.",
+                        e
+                    );
+                    Arc::new(
+                        BaselineRegistry::new(&repo_path, settings.git.custom_remotes.clone())
+                            .unwrap_or_else(|_| {
+                                panic!("Critical error initializing BaselineRegistry: {}", e)
+                            }),
+                    )
+                }
+            };
 
-        // Initialize Provider
-        let provider = create_provider(&settings).expect("Failed to create AI provider");
+        let provider = create_provider_cached(
+            &settings,
+            settings.ai.response_cache,
+            settings.ai.response_cache_ttl_days,
+        )
+        .await
+        .expect("Failed to create AI provider");
 
-        // Initialize CacheManager
-        // Assuming prompts are in "third_party/prompts/kernel" in CWD.
         Self {
             db,
             settings,
@@ -358,10 +368,12 @@ impl Reviewer {
             } else {
                 ctx.baseline_registry
                     .resolve_candidates(&all_files, &subject, body.as_deref())
+                    .await
             }
         } else {
             ctx.baseline_registry
                 .resolve_candidates(&all_files, &subject, body.as_deref())
+                .await
         };
 
         // 1. Find a working baseline (apply series)
@@ -644,16 +656,24 @@ impl Reviewer {
             // Cleanup worktree here since we kept it alive for reuse
             let _ = worktree.remove().await;
 
-            let final_status = if review_success {
-                ReviewStatus::Reviewed.as_str().to_string()
+            let current_status = ctx.db.get_patchset_status(patchset_id).await.ok().flatten();
+            if current_status.as_deref() == Some(ReviewStatus::Cancelled.as_str()) {
+                info!(
+                    "Patchset {} was cancelled during review, preserving status",
+                    patchset_id
+                );
             } else {
-                ReviewStatus::Failed.as_str().to_string()
-            };
+                let final_status = if review_success {
+                    ReviewStatus::Reviewed.as_str().to_string()
+                } else {
+                    ReviewStatus::Failed.as_str().to_string()
+                };
 
-            let _ = ctx
-                .db
-                .update_patchset_status(patchset_id, &final_status)
-                .await;
+                let _ = ctx
+                    .db
+                    .update_patchset_status(patchset_id, &final_status)
+                    .await;
+            }
         } else {
             // No baseline found
             warn!("No working baseline found for patchset {}", patchset_id);
@@ -674,6 +694,24 @@ impl Reviewer {
                 .update_patchset_status(patchset_id, ReviewStatus::FailedToApply.as_str())
                 .await;
         }
+
+        if let Some(stats) = ctx.provider.cache_stats() {
+            use crate::ai::cache::fmt_thousands;
+            let total_hits = stats.hits_this_session + stats.hits_prev_session;
+            let total_tokens = stats.tokens_saved_this_session + stats.tokens_saved_prev_session;
+            if total_hits > 0 {
+                info!(
+                    "Patchset {} cache summary — {} hits ({} this session, {} previous), {} tokens saved ({} this session, {} previous)",
+                    patchset_id,
+                    fmt_thousands(total_hits),
+                    fmt_thousands(stats.hits_this_session),
+                    fmt_thousands(stats.hits_prev_session),
+                    fmt_thousands(total_tokens),
+                    fmt_thousands(stats.tokens_saved_this_session),
+                    fmt_thousands(stats.tokens_saved_prev_session),
+                );
+            }
+        }
     }
 
     async fn prepare_baseline_worktree(
@@ -688,6 +726,7 @@ impl Reviewer {
     ) {
         let mut attempts: Vec<BaselineAttempt> = Vec::new();
         let repo_path = PathBuf::from(&ctx.settings.git.repository_path);
+        let mut tested_shas = std::collections::HashSet::new();
 
         for candidate in candidates {
             let baseline_ref = candidate.as_str();
@@ -713,16 +752,48 @@ impl Reviewer {
             let baseline_sha = match get_commit_hash(&repo_path, &baseline_ref).await {
                 Ok(sha) => sha,
                 Err(e) => {
-                    let msg = format!("Failed to resolve baseline ref {}: {}\n", baseline_ref, e);
-                    current_log.push_str(&msg);
-                    attempts.push(BaselineAttempt {
-                        baseline: baseline_ref.clone(),
-                        status: current_status,
-                        log: current_log,
-                    });
-                    continue;
+                    if let BaselineResolution::Commit(sha_str) = candidate {
+                        // Attempt to fetch the missing commit from origin
+                        let _ = Command::new("git")
+                            .current_dir(&repo_path)
+                            .args(["fetch", "origin", sha_str])
+                            .output()
+                            .await;
+                        // Retry resolving
+                        match get_commit_hash(&repo_path, &baseline_ref).await {
+                            Ok(sha) => sha,
+                            Err(e2) => {
+                                let msg = format!(
+                                    "Failed to resolve baseline ref {}: {}\n",
+                                    baseline_ref, e2
+                                );
+                                current_log.push_str(&msg);
+                                attempts.push(BaselineAttempt {
+                                    baseline: baseline_ref.clone(),
+                                    status: current_status,
+                                    log: current_log,
+                                });
+                                continue;
+                            }
+                        }
+                    } else {
+                        let msg =
+                            format!("Failed to resolve baseline ref {}: {}\n", baseline_ref, e);
+                        current_log.push_str(&msg);
+                        attempts.push(BaselineAttempt {
+                            baseline: baseline_ref.clone(),
+                            status: current_status,
+                            log: current_log,
+                        });
+                        continue;
+                    }
                 }
             };
+
+            if !tested_shas.insert(baseline_sha.clone()) {
+                info!("Skipping duplicate baseline SHA {}", baseline_sha);
+                continue;
+            }
 
             let baseline_display = format!("{} ({})", baseline_ref, baseline_sha);
             current_log = format!("Trying baseline: {}\n", baseline_display);
@@ -1441,7 +1512,9 @@ async fn run_review_tool(
         &settings.review.worktree_dir,
         "--ai-provider",
         match settings.ai.provider.as_str() {
-            "claude" | "stdio-claude" | "claude-cli" | "codex-cli" => "stdio-claude",
+            "claude" | "stdio-claude" | "claude-cli" | "codex-cli" | "copilot-cli" | "kiro-cli" => {
+                "stdio-claude"
+            }
             _ => "stdio-gemini",
         },
     ]);
@@ -1486,6 +1559,7 @@ async fn run_review_tool(
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
 
     let mut child = cmd.spawn()?;
 
@@ -1594,6 +1668,7 @@ async fn run_review_tool(
                                     }
                                     let ctx_tag = req.context_tag.clone().unwrap_or_default();
                                     let resp_payload = crate::ai::LOG_CONTEXT.scope(ctx_tag, async {
+                                    let mut local_transient_errors = 0;
                                     loop {
                                         let slept = quota_manager.wait_for_access().await;
                                         deadline += slept;
@@ -1610,27 +1685,27 @@ async fn run_review_tool(
                                                 break Ok(resp);
                                             }
                                             Err(e) => {
-                                                let err_str = e.to_string();
-
-                                                // Categorize and report errors to QuotaManager
-                                                if err_str.contains("Quota exceeded")
-                                                    || err_str.contains("429")
-                                                {
-                                                    quota_manager
-                                                        .report_quota_error(Duration::from_secs(60))
-                                                        .await;
-                                                    continue;
+                                                match classify_ai_error(&e) {
+                                                    AiErrorClass::RateLimit { retry_after } => {
+                                                        quota_manager
+                                                            .report_quota_error(retry_after)
+                                                            .await;
+                                                        continue;
+                                                    }
+                                                    AiErrorClass::Transient { retry_after } => {
+                                                        local_transient_errors += 1;
+                                                        let backoff_secs = (1.0 * (2.0_f64.powi(local_transient_errors - 1))).min(60.0);
+                                                        let backoff = std::time::Duration::from_secs_f64(backoff_secs).max(retry_after);
+                                                        tracing::warn!(
+                                                            "AI provider transient error (streak: {}). Locally backing off for {:.2}s",
+                                                            local_transient_errors,
+                                                            backoff.as_secs_f64()
+                                                        );
+                                                        tokio::time::sleep(backoff).await;
+                                                        continue;
+                                                    }
+                                                    AiErrorClass::Fatal => break Err(e),
                                                 }
-                                                if err_str.contains("Transient error")
-                                                    || err_str.contains("503")
-                                                    || err_str.contains("529")
-                                                    || err_str.contains("overloaded")
-                                                {
-                                                    quota_manager.report_transient_error().await;
-                                                    continue;
-                                                }
-
-                                                break Err(e);
                                             }
                                         }
                                     }
@@ -1701,7 +1776,10 @@ async fn run_review_tool(
                                             json!({ "type": "ai_response", "payload": p })
                                         }
                                         Err(e) => {
-                                            json!({ "type": "error", "payload": e.to_string() })
+                                            let message = e.to_string();
+                                            let class = classify_ai_error(&e);
+                                            let payload = RemoteAiErrorPayload::new(message, class);
+                                            json!({ "type": "error", "payload": payload })
                                         }
                                     };
                                     let mut reply_str = serde_json::to_string(&reply)?;
@@ -1924,23 +2002,6 @@ impl Reviewer {
             });
         }
 
-        if findings_count == 0 {
-            info!("No issues found for patch {}, skipping email.", patch_id);
-            ctx.db
-                .insert_email_outbox(
-                    patch_id,
-                    "Skipped",
-                    "[]",
-                    "[]",
-                    "Skipped",
-                    msg_id.trim_matches(|c| c == '<' || c == '>'),
-                    msg_id.trim_matches(|c| c == '<' || c == '>'),
-                    "Skipped due to no findings",
-                )
-                .await?;
-            return Ok(());
-        }
-
         let action = EmailRouter::resolve_recipients(
             &policy,
             &to_list,
@@ -1948,6 +2009,110 @@ impl Reviewer {
             &patch_author,
             &sender_address,
         );
+
+        if findings_count == 0 {
+            let mut sent_positive_review = false;
+            if let EmailAction::Send {
+                to,
+                cc,
+                send_positive_review,
+            } = &action
+                && *send_positive_review
+            {
+                let mut body_head = String::new();
+                if let Some(body) = &msg_details.body {
+                    let mut commit_msg_lines = Vec::new();
+                    for line in body.lines() {
+                        if line == "---" || line.starts_with("diff --git ") {
+                            break;
+                        }
+                        commit_msg_lines.push(line);
+                    }
+
+                    let mut sob_index = None;
+                    for (i, line) in commit_msg_lines.iter().enumerate().rev() {
+                        if line.to_lowercase().starts_with("signed-off-by:") {
+                            sob_index = Some(i);
+                            break;
+                        }
+                    }
+
+                    let end_index = sob_index.unwrap_or(commit_msg_lines.len().saturating_sub(1));
+                    if !commit_msg_lines.is_empty() && end_index < commit_msg_lines.len() {
+                        let head_lines = &commit_msg_lines[0..=end_index];
+                        if head_lines.len() > 30 {
+                            let top = 15;
+                            let bottom = 5;
+                            for line in &head_lines[0..top] {
+                                body_head.push_str("> ");
+                                body_head.push_str(line);
+                                body_head.push('\n');
+                            }
+                            body_head.push_str("> [ ... ]\n");
+                            for line in &head_lines
+                                [head_lines.len().saturating_sub(bottom)..head_lines.len()]
+                            {
+                                body_head.push_str("> ");
+                                body_head.push_str(line);
+                                body_head.push('\n');
+                            }
+                        } else {
+                            for line in head_lines {
+                                body_head.push_str("> ");
+                                body_head.push_str(line);
+                                body_head.push('\n');
+                            }
+                        }
+                    }
+                }
+
+                if !body_head.is_empty() {
+                    let to_json = serde_json::to_string(&to).unwrap_or_else(|_| "[]".to_string());
+                    let cc_json = serde_json::to_string(&cc).unwrap_or_else(|_| "[]".to_string());
+                    let subject_prefix = if patch_subject.to_lowercase().starts_with("re:") {
+                        ""
+                    } else {
+                        "Re: "
+                    };
+                    let final_subject = format!("{}{}", subject_prefix, patch_subject);
+                    let final_body = format!(
+                        "{}\nSashiko has reviewed this patch and found no issues. It looks great!\n\n-- \nSashiko AI review · {}\n",
+                        body_head, target_url
+                    );
+
+                    ctx.db
+                        .insert_email_outbox(
+                            patch_id,
+                            "Pending",
+                            &to_json,
+                            &cc_json,
+                            &final_subject,
+                            msg_id.trim_matches(|c| c == '<' || c == '>'),
+                            msg_id.trim_matches(|c| c == '<' || c == '>'),
+                            &final_body,
+                        )
+                        .await?;
+                    sent_positive_review = true;
+                }
+            }
+
+            if !sent_positive_review {
+                info!("No issues found for patch {}, skipping email.", patch_id);
+                ctx.db
+                    .insert_email_outbox(
+                        patch_id,
+                        "Skipped",
+                        "[]",
+                        "[]",
+                        "Skipped",
+                        msg_id.trim_matches(|c| c == '<' || c == '>'),
+                        msg_id.trim_matches(|c| c == '<' || c == '>'),
+                        "Skipped due to no findings",
+                    )
+                    .await?;
+            }
+            return Ok(());
+        }
 
         match action {
             EmailAction::Mute => {
@@ -1965,7 +2130,7 @@ impl Reviewer {
                     )
                     .await?;
             }
-            EmailAction::Send { to, cc } => {
+            EmailAction::Send { to, cc, .. } => {
                 let to_json = serde_json::to_string(&to)?;
                 let cc_json = serde_json::to_string(&cc)?;
 
@@ -1984,7 +2149,7 @@ impl Reviewer {
                     && !findings_arr.is_empty()
                 {
                     header.push_str(&format!(
-                        "Sashiko AI review found {} potential issue(s):\n",
+                        "Thank you for your contribution! Sashiko AI review found {} potential issue(s) to consider:\n",
                         findings_arr.len()
                     ));
 
@@ -2056,18 +2221,21 @@ mod tests {
     use async_trait::async_trait;
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use tempfile::tempdir;
 
     struct MockProvider;
     #[async_trait]
     impl AiProvider for MockProvider {
         async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
-            // Simulate a slow AI response to allow logs to accumulate
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             Ok(AiResponse {
-                content: Some("Mocked AI response".to_string()),
+                content: Some("<final_verdict>Mocked AI response</final_verdict>".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 usage: None,
             })
@@ -2081,6 +2249,125 @@ mod tests {
                 context_window_size: 1000,
             }
         }
+    }
+
+    struct FailingProvider;
+
+    #[async_trait]
+    impl AiProvider for FailingProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            Err(anyhow::anyhow!("fatal provider failure"))
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    struct RateLimitThenSuccessProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AiProvider for RateLimitThenSuccessProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(crate::ai::openai::OpenAiCompatError::RateLimitExceeded(
+                    std::time::Duration::from_millis(1),
+                )
+                .into());
+            }
+
+            Ok(AiResponse {
+                content: Some("Recovered after rate limit".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    async fn run_single_ai_request_mock(
+        mock_script: &str,
+        provider: Arc<dyn AiProvider>,
+    ) -> Result<Value> {
+        let temp_dir = tempdir()?;
+        let bin_path = temp_dir.path().join("mock_review");
+
+        std::fs::write(&bin_path, mock_script)?;
+        std::fs::set_permissions(&bin_path, Permissions::from_mode(0o755))?;
+
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.review.review_tool_override = Some(bin_path);
+        settings.review.timeout_seconds = 5;
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+        let quota_manager = Arc::new(QuotaManager::new());
+
+        let thread_id = db.create_thread("msg_id_1", "Subject", 1000).await?;
+        db.create_message(
+            "msg_id_p1",
+            thread_id,
+            None,
+            "Author",
+            "Subject",
+            1000,
+            "Body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "msg_id_1", "Subject", "Author", 1000, 1, 1, "", "", None, 1,
+                None, false, None, None,
+            )
+            .await?
+            .expect("Failed to create patchset");
+        let p_id = db
+            .create_patch(ps_id, "msg_id_p1", 1, "diff --git a/foo.c b/foo.c\n+int x;")
+            .await?;
+        let review_id = db
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .await?;
+
+        run_review_tool(
+            ps_id,
+            &json!({}),
+            &settings,
+            db,
+            "HEAD",
+            Some(1),
+            None,
+            quota_manager,
+            review_id,
+            None,
+            provider,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -2128,6 +2415,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
 
         let mut child = cmd.spawn()?;
         let mut stdin = child.stdin.take().unwrap();
@@ -2186,10 +2474,60 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
     }
 
     #[tokio::test]
+    async fn test_run_review_tool_sends_typed_fatal_error_payload() -> Result<()> {
+        let mock_script = r#"#!/bin/bash
+read -r input
+echo '{"type":"ai_request","payload":{"messages":[{"role":"user","content":"hello"}]}}'
+read -r ai_response
+if [[ "$ai_response" == *'"type":"error"'* && "$ai_response" == *'"message":"fatal provider failure"'* && "$ai_response" == *'"class":"fatal"'* ]]; then
+    echo '{"patchset_id":1,"patches":[{"index":1,"status":"typed_fatal"}]}'
+else
+    echo '{"patchset_id":1,"patches":[{"index":1,"status":"unexpected"}]}'
+fi
+"#;
+
+        let result = run_single_ai_request_mock(mock_script, Arc::new(FailingProvider)).await?;
+
+        assert_eq!(result["patches"][0]["status"], "typed_fatal");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_review_tool_retries_rate_limits_without_child_error() -> Result<()> {
+        let mock_script = r#"#!/bin/bash
+read -r input
+echo '{"type":"ai_request","payload":{"messages":[{"role":"user","content":"hello"}]}}'
+read -r ai_response
+if [[ "$ai_response" == *'"type":"error"'* ]]; then
+    echo '{"patchset_id":1,"patches":[{"index":1,"status":"error_written"}]}'
+else
+    echo '{"patchset_id":1,"patches":[{"index":1,"status":"applied"}]}'
+fi
+"#;
+        let provider = Arc::new(RateLimitThenSuccessProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let provider_for_tool: Arc<dyn AiProvider> = provider.clone();
+
+        let result = run_single_ai_request_mock(mock_script, provider_for_tool).await?;
+
+        assert_eq!(result["patches"][0]["status"], "applied");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_skip_ignored_files() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let bin_path = temp_dir.path().join("mock_review");
+        std::fs::write(&bin_path, "#!/bin/sh\nexit 0")?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755))?;
+
         let mut settings = Settings::new()?;
         settings.database.url = ":memory:".to_string();
         settings.review.ignore_files = vec!["ignored.txt".to_string(), "ignore_dir/".to_string()];
+        settings.review.review_tool_override = Some(bin_path);
 
         let db = Arc::new(Database::new(&settings.database).await?);
         db.migrate().await?;
@@ -2200,7 +2538,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             semaphore: Arc::new(Semaphore::new(1)),
             db: db.clone(),
             settings: settings.clone(),
-            baseline_registry: Arc::new(BaselineRegistry::new(Path::new(".")).unwrap()),
+            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None).unwrap()),
             quota_manager,
             target_review_count: 1,
             provider,
@@ -2398,6 +2736,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             Ok(AiResponse {
                 content: Some("Mocked AI response".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 usage: Some(crate::ai::AiUsage {
                     prompt_tokens: self.prompt_tokens,

@@ -36,9 +36,13 @@ pub struct SubsystemPolicy {
     #[serde(default)]
     pub ignored_emails: Vec<String>,
     #[serde(default)]
+    pub subject_prefixes: Vec<String>,
+    #[serde(default)]
     pub patchwork: PatchworkPolicy,
     #[serde(default)]
     pub embargo_hours: Option<u32>,
+    #[serde(default)]
+    pub send_positive_review: bool,
 }
 
 impl EmailPolicyConfig {

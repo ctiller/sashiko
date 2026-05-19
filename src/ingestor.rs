@@ -254,7 +254,7 @@ impl Ingestor {
             }
         }
 
-        epochs.sort_by(|a, b| b.0.cmp(&a.0)); // Descending order
+        epochs.sort_by_key(|b| std::cmp::Reverse(b.0)); // Descending order
 
         if epochs.is_empty() {
             warn!(
@@ -375,7 +375,13 @@ impl Ingestor {
             let group_name = &group_name;
             self.db.ensure_mailing_list(&name, group_name).await?;
 
-            let info = client.group(group_name).await?;
+            let info = match client.group(group_name).await {
+                Ok(i) => i,
+                Err(e) => {
+                    error!("Failed to select group {}: {}", group_name, e);
+                    continue;
+                }
+            };
             let last_known = self.db.get_last_article_num(group_name).await?;
 
             info!(

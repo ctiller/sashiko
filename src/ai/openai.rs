@@ -14,8 +14,8 @@
 
 use crate::ai::token_budget::TokenBudget;
 use crate::ai::{
-    AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiUsage, ProviderCapabilities,
-    ToolCall,
+    AiErrorClass, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiUsage,
+    ClassifyAiError, ProviderCapabilities, ToolCall, classify_status_code,
 };
 use crate::utils::redact_secret;
 use anyhow::Result;
@@ -113,6 +113,23 @@ pub enum OpenAiCompatError {
     ApiError(reqwest::StatusCode, String),
 }
 
+impl ClassifyAiError for OpenAiCompatError {
+    fn ai_error_class(&self) -> AiErrorClass {
+        match self {
+            OpenAiCompatError::RateLimitExceeded(retry_after) => AiErrorClass::RateLimit {
+                retry_after: *retry_after,
+            },
+            OpenAiCompatError::TransientError(retry_after, _) => AiErrorClass::Transient {
+                retry_after: *retry_after,
+            },
+            OpenAiCompatError::AuthenticationError(_) => AiErrorClass::Fatal,
+            OpenAiCompatError::ApiError(status, _) => {
+                classify_status_code(*status).unwrap_or(AiErrorClass::Fatal)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAiProviderType {
     /// Official OpenAI API — uses `max_completion_tokens`.
@@ -172,7 +189,7 @@ impl OpenAiCompatClient {
             "https://open.bigmodel.cn/api/paas/v4/chat/completions".to_string()
         } else if model.starts_with("moonshot-") {
             "https://api.moonshot.cn/v1/chat/completions".to_string()
-        } else if model.starts_with("abab7-") {
+        } else if model.starts_with("abab7-") || model.starts_with("MiniMax-") {
             "https://api.minimax.chat/v1/text/chatcompletion_v2".to_string()
         } else {
             "https://api.openai.com/v1/chat/completions".to_string()
@@ -182,7 +199,7 @@ impl OpenAiCompatClient {
     pub fn default_context_window_for_model(model: &str) -> usize {
         if model.starts_with("glm-") || model.starts_with("moonshot-") {
             128_000
-        } else if model.starts_with("abab7-") {
+        } else if model.starts_with("abab7-") || model.starts_with("MiniMax-") {
             245_760
         } else if model.starts_with("gpt-4o") || model.starts_with("gpt-4-turbo") {
             128_000
@@ -237,15 +254,12 @@ impl OpenAiCompatClient {
         let status = res.status();
         let status_code = status.as_u16();
 
-        let retry_after_duration = if status_code == 429 {
-            res.headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(Duration::from_secs)
-        } else {
-            None
-        };
+        let retry_after_duration = res
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs);
 
         let error_text = res.text().await.unwrap_or_default();
 
@@ -263,10 +277,10 @@ impl OpenAiCompatClient {
                 ))?
             }
             401 | 403 => Err(OpenAiCompatError::AuthenticationError(error_text))?,
-            500 | 502 | 503 | 504 => {
+            500..=599 => {
                 tracing::warn!("OpenAI Server Error {}: {}", status, error_text);
                 Err(OpenAiCompatError::TransientError(
-                    Duration::from_secs(30),
+                    retry_after_duration.unwrap_or(Duration::from_secs(0)),
                     error_text,
                 ))?
             }
@@ -441,6 +455,7 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
     Ok(AiResponse {
         content,
         thought: None,
+        thought_signature: None,
         tool_calls,
         usage,
     })
@@ -500,8 +515,62 @@ impl AiProvider for OpenAiCompatClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::{AiMessage, AiTool};
+    use crate::ai::{AiErrorClass, AiMessage, AiTool, ClassifyAiError, DEFAULT_RETRY_AFTER};
     use serde_json::json;
+
+    #[test]
+    fn test_rate_limit_exceeded_classifies_as_rate_limit() {
+        let retry_after = Duration::from_secs(7);
+        let err = OpenAiCompatError::RateLimitExceeded(retry_after);
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::RateLimit { retry_after }
+        );
+    }
+
+    #[test]
+    fn test_transient_error_classifies_as_transient() {
+        let retry_after = Duration::from_secs(11);
+        let err = OpenAiCompatError::TransientError(retry_after, "busy".to_string());
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::Transient { retry_after }
+        );
+    }
+
+    #[test]
+    fn test_authentication_error_classifies_as_fatal() {
+        let err = OpenAiCompatError::AuthenticationError("bad key".to_string());
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_api_error_server_status_classifies_as_transient() {
+        let err = OpenAiCompatError::ApiError(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable".to_string(),
+        );
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::Transient {
+                retry_after: DEFAULT_RETRY_AFTER,
+            }
+        );
+    }
+
+    #[test]
+    fn test_api_error_client_status_classifies_as_fatal() {
+        let err = OpenAiCompatError::ApiError(
+            reqwest::StatusCode::BAD_REQUEST,
+            "bad request".to_string(),
+        );
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
 
     #[test]
     fn test_translate_request_system_and_user() -> Result<()> {
@@ -511,6 +580,7 @@ mod tests {
                 role: AiRole::User,
                 content: Some("Hello!".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
             }],
@@ -545,6 +615,7 @@ mod tests {
                     role: AiRole::System,
                     content: Some("Be concise.".to_string()),
                     thought: None,
+                    thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -552,6 +623,7 @@ mod tests {
                     role: AiRole::User,
                     content: Some("Say hi.".to_string()),
                     thought: None,
+                    thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -583,6 +655,7 @@ mod tests {
                 role: AiRole::Assistant,
                 content: Some("I'll use a tool.".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "call_123".to_string(),
                     function_name: "test_tool".to_string(),
@@ -622,6 +695,7 @@ mod tests {
                 role: AiRole::Tool,
                 content: Some(json!({"result": "success"}).to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: Some("call_123".to_string()),
             }],
@@ -702,6 +776,7 @@ mod tests {
                     role: AiRole::User,
                     content: Some("Use tool".to_string()),
                     thought: None,
+                    thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -709,6 +784,7 @@ mod tests {
                     role: AiRole::Assistant,
                     content: None,
                     thought: None,
+                    thought_signature: None,
                     tool_calls: Some(vec![ToolCall {
                         id: "c1".to_string(),
                         function_name: "t1".to_string(),
@@ -721,6 +797,7 @@ mod tests {
                     role: AiRole::Tool,
                     content: Some(r#"{"ok":true}"#.to_string()),
                     thought: None,
+                    thought_signature: None,
                     tool_calls: None,
                     tool_call_id: Some("c1".to_string()),
                 },
@@ -759,6 +836,7 @@ mod tests {
                 role: AiRole::User,
                 content: Some("Score this.".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
             }],
@@ -795,6 +873,7 @@ mod tests {
                 role: AiRole::User,
                 content: Some("Return the score as JSON.".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
             }],
@@ -828,6 +907,7 @@ mod tests {
                 role: AiRole::User,
                 content: Some("Test".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
             }],
@@ -943,6 +1023,7 @@ mod tests {
                     role: AiRole::User,
                     content: Some("Short message".to_string()),
                     thought: None,
+                    thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -950,6 +1031,7 @@ mod tests {
                     role: AiRole::Assistant,
                     content: None,
                     thought: None,
+                    thought_signature: None,
                     tool_calls: Some(vec![ToolCall {
                         id: "c1".to_string(),
                         function_name: "my_function".to_string(),
@@ -982,6 +1064,7 @@ mod tests {
                 role: AiRole::User,
                 content: Some("Test".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
             }],
@@ -1012,6 +1095,7 @@ mod tests {
                 role: AiRole::User,
                 content: Some("Test".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
             }],

@@ -17,10 +17,9 @@ use clap::Parser;
 use futures::stream::StreamExt;
 use regex::Regex;
 use reqwest::Client;
-use sashiko::ai::claude::ClaudeError;
-use sashiko::ai::gemini::GeminiError;
-use sashiko::ai::openai::OpenAiCompatError;
-use sashiko::ai::{AiMessage, AiProvider, AiRequest, AiRole, create_provider};
+use sashiko::ai::{
+    AiErrorClass, AiMessage, AiProvider, AiRequest, AiRole, classify_ai_error, create_provider,
+};
 use sashiko::db::Database;
 use sashiko::settings::Settings;
 use serde::{Deserialize, Serialize};
@@ -117,7 +116,11 @@ async fn main() -> Result<()> {
         "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git".to_string()
     });
 
-    let target_url = format!("http://127.0.0.1:{}/api/submit", port);
+    let target_url = if settings.server.host.contains(':') {
+        format!("http://[::1]:{}/api/submit", port)
+    } else {
+        format!("http://{}:{}/api/submit", settings.server.host, port)
+    };
     let client = Client::new();
 
     // --- Phase 1: Ingestion ---
@@ -289,13 +292,24 @@ async fn main() -> Result<()> {
 
     if valid_metric_count > 0 {
         info!("--- Performance Metrics (averages per reviewed patch) ---");
-        info!("Avg Tokens In:  {}", total_tokens_in / valid_metric_count);
-        info!("Avg Tokens Out: {}", total_tokens_out / valid_metric_count);
+        info!(
+            "Avg Tokens In:  {}",
+            total_tokens_in.checked_div(valid_metric_count).unwrap_or(0)
+        );
+        info!(
+            "Avg Tokens Out: {}",
+            total_tokens_out
+                .checked_div(valid_metric_count)
+                .unwrap_or(0)
+        );
         info!(
             "Avg Turns:      {:.1}",
             total_turns as f64 / valid_metric_count as f64
         );
-        info!("Avg Time:       {}s", total_duration / valid_metric_count);
+        info!(
+            "Avg Time:       {}s",
+            total_duration.checked_div(valid_metric_count).unwrap_or(0)
+        );
     }
 
     info!("Detailed results written to benchmark_results.json");
@@ -528,6 +542,7 @@ async fn process_entry(
                 role: AiRole::User,
                 content: Some(prompt.clone()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
             }],
@@ -539,38 +554,31 @@ async fn process_entry(
 
         match client.generate_content(req).await {
             Ok(r) => break r,
-            Err(e) => {
-                let retry_duration =
-                    e.downcast_ref::<GeminiError>()
-                        .and_then(|err| match err {
-                            GeminiError::QuotaExceeded(d) | GeminiError::TransientError(d, _) => {
-                                Some(*d)
-                            }
-                            _ => None,
-                        })
-                        .or_else(|| {
-                            e.downcast_ref::<ClaudeError>().and_then(|err| match err {
-                                ClaudeError::RateLimitExceeded(d)
-                                | ClaudeError::OverloadedError(d) => Some(*d),
-                                _ => None,
-                            })
-                        })
-                        .or_else(|| {
-                            e.downcast_ref::<OpenAiCompatError>()
-                                .and_then(|err| match err {
-                                    OpenAiCompatError::RateLimitExceeded(d)
-                                    | OpenAiCompatError::TransientError(d, _) => Some(*d),
-                                    _ => None,
-                                })
-                        });
-
-                let duration = retry_duration.unwrap_or(std::time::Duration::from_secs(30));
-                warn!(
-                    "API error ({}), pausing for {:?} before retry...",
-                    e, duration
-                );
-                tokio::time::sleep(duration).await;
-            }
+            Err(e) => match classify_ai_error(&e) {
+                AiErrorClass::RateLimit { retry_after }
+                | AiErrorClass::Transient { retry_after } => {
+                    warn!(
+                        "API error ({}), pausing for {:?} before retry...",
+                        e, retry_after
+                    );
+                    tokio::time::sleep(retry_after).await;
+                }
+                AiErrorClass::Fatal => {
+                    return BenchmarkResult {
+                        commit: entry.commit,
+                        problem_description,
+                        found: false,
+                        status: "UNKNOWN".to_string(),
+                        explanation: format!("Evaluation failed: {}", e),
+                        findings_count,
+                        concerns_count,
+                        tokens_in,
+                        tokens_out,
+                        turns,
+                        duration_secs,
+                    };
+                }
+            },
         }
     };
 

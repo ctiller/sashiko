@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ai::{AiMessage, AiProvider, AiRequest, AiResponseFormat, AiRole};
+use crate::ai::{
+    AiErrorClass, AiMessage, AiProvider, AiRequest, AiResponseFormat, AiRole, ClassifyAiError,
+};
 use crate::worker::tools::ToolBox;
 use anyhow::{Context, Result};
 
@@ -32,6 +34,17 @@ pub enum ReviewError {
     #[error("Format validation failed: {0}")]
     FormatRejection(String),
 }
+
+impl ClassifyAiError for ReviewError {
+    fn ai_error_class(&self) -> AiErrorClass {
+        match self {
+            ReviewError::LimitExceeded => AiErrorClass::Fatal,
+            ReviewError::BudgetExceeded(_) => AiErrorClass::Fatal,
+            ReviewError::FormatRejection(_) => AiErrorClass::Fatal,
+        }
+    }
+}
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -58,6 +71,13 @@ pub struct PatchInput {
     pub message_id: Option<String>,
     #[serde(default)]
     pub commit_id: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct ReviewInput {
+    pub id: i64,
+    pub subject: String,
+    pub patches: Vec<PatchInput>,
 }
 
 fn validate_inline_format(content: &str) -> std::result::Result<(), String> {
@@ -665,6 +685,7 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                     role: crate::ai::AiRole::User,
                     content: Some(format!("{}\n\n{}", shared_context, planning_prompt)),
                     thought: None,
+                    thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
                 }],
@@ -1170,6 +1191,7 @@ Example:
             role: AiRole::User,
             content: Some(user_prompt.clone()),
             thought: None,
+            thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
         };
@@ -1183,6 +1205,7 @@ Example:
                 role: AiRole::System,
                 content: Some(clean_system_prompt.clone()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -1191,6 +1214,7 @@ Example:
             role: AiRole::User,
             content: Some(clean_user_prompt),
             thought: None,
+            thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
         });
@@ -1235,6 +1259,7 @@ Example:
                 role: AiRole::Assistant,
                 content: resp.content.clone(),
                 thought: resp.thought.clone(),
+                thought_signature: resp.thought_signature.clone(),
                 tool_calls: resp.tool_calls.clone(),
                 tool_call_id: None,
             };
@@ -1270,6 +1295,7 @@ Example:
                         role: AiRole::Tool,
                         content: Some(result),
                         thought: None,
+                        thought_signature: None,
                         tool_calls: None,
                         tool_call_id: Some(call.id.clone()),
                     });
@@ -1336,6 +1362,7 @@ Example:
                     role: AiRole::Assistant,
                     content: Some(content.to_string()),
                     thought: None,
+                    thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
                 });
@@ -1346,6 +1373,7 @@ Example:
                         e
                     )),
                     thought: None,
+                    thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
                 });
@@ -1631,6 +1659,27 @@ mod tests {
     }
 
     // ReviewError tests
+
+    #[test]
+    fn test_limit_exceeded_classifies_as_fatal() {
+        let err = ReviewError::LimitExceeded;
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_budget_exceeded_classifies_as_fatal() {
+        let err = ReviewError::BudgetExceeded("1000 tokens used (limit: 500)".to_string());
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_format_rejection_classifies_as_fatal() {
+        let err = ReviewError::FormatRejection("contains markdown code blocks".to_string());
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
 
     #[test]
     fn test_limit_exceeded_downcasts_as_review_error() {

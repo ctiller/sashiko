@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "vertex")]
+use anyhow::Context;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::settings::Settings;
 
@@ -43,6 +46,9 @@ pub struct AiMessage {
     /// Optional thoughts of the AI model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought: Option<String>,
+    /// Optional thoughts signature of the AI model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
     /// Optional tool calls requested by the AI (usually only for Assistant role).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -129,11 +135,141 @@ pub struct AiResponse {
     /// Optional thought content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought: Option<String>,
+    /// Optional thought signature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
     /// Tool calls requested by the AI, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     /// Optional token usage information.
     pub usage: Option<AiUsage>,
+}
+
+/// Classifies a remote AI error using the typed stdio protocol payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "class", rename_all = "snake_case")]
+pub enum AiErrorClass {
+    /// The request failed permanently and should not be retried.
+    Fatal,
+    /// The provider is rate limited until the specified backoff expires.
+    RateLimit {
+        #[serde(rename = "retry_after_secs", with = "duration_secs")]
+        retry_after: Duration,
+    },
+    /// The provider returned a transient failure that may succeed later.
+    Transient {
+        #[serde(rename = "retry_after_secs", with = "duration_secs")]
+        retry_after: Duration,
+    },
+}
+
+mod duration_secs {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(duration.as_secs())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
+        let secs = u64::deserialize(deserializer)?;
+        Ok(Duration::from_secs(secs))
+    }
+}
+
+/// Typed payload for remote AI errors sent over the stdio protocol.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RemoteAiErrorPayload {
+    pub message: String,
+    #[serde(flatten)]
+    pub class: AiErrorClass,
+}
+
+impl RemoteAiErrorPayload {
+    pub fn new(message: String, class: AiErrorClass) -> Self {
+        Self { message, class }
+    }
+
+    pub fn into_error(self) -> RemoteAiError {
+        RemoteAiError {
+            message: self.message,
+            class: self.class,
+        }
+    }
+}
+
+/// Error returned by a remote AI provider through the typed stdio protocol.
+#[derive(Debug, thiserror::Error)]
+#[error("Remote AI Error: {message}")]
+pub struct RemoteAiError {
+    pub message: String,
+    pub class: AiErrorClass,
+}
+
+pub(crate) const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+pub trait ClassifyAiError {
+    fn ai_error_class(&self) -> AiErrorClass;
+}
+
+impl ClassifyAiError for RemoteAiError {
+    fn ai_error_class(&self) -> AiErrorClass {
+        self.class
+    }
+}
+
+pub(crate) fn classify_status_code(status: reqwest::StatusCode) -> Option<AiErrorClass> {
+    match status {
+        reqwest::StatusCode::TOO_MANY_REQUESTS => Some(AiErrorClass::RateLimit {
+            retry_after: DEFAULT_RETRY_AFTER,
+        }),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        | reqwest::StatusCode::BAD_GATEWAY
+        | reqwest::StatusCode::SERVICE_UNAVAILABLE
+        | reqwest::StatusCode::GATEWAY_TIMEOUT => Some(AiErrorClass::Transient {
+            retry_after: DEFAULT_RETRY_AFTER,
+        }),
+        status if status.as_u16() == 529 => Some(AiErrorClass::Transient {
+            retry_after: DEFAULT_RETRY_AFTER,
+        }),
+        _ => None,
+    }
+}
+
+/// Classifies AI errors through typed provider and stdio error downcasts.
+pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
+    if let Some(e) = error.downcast_ref::<RemoteAiError>() {
+        return e.ai_error_class();
+    }
+    if let Some(e) = error.downcast_ref::<openai::OpenAiCompatError>() {
+        return e.ai_error_class();
+    }
+    if let Some(e) = error.downcast_ref::<claude::ClaudeError>() {
+        return e.ai_error_class();
+    }
+    if let Some(e) = error.downcast_ref::<gemini::GeminiError>() {
+        return e.ai_error_class();
+    }
+    if let Some(e) = error.downcast_ref::<crate::worker::prompts::ReviewError>() {
+        return e.ai_error_class();
+    }
+    AiErrorClass::Fatal
+}
+
+/// Decodes a single line of the stdio AI protocol into an [`AiResponse`].
+///
+/// Typed error payloads surface as [`RemoteAiError`].
+pub(crate) fn decode_stdio_ai_response(line: &str) -> Result<AiResponse> {
+    let resp_msg: serde_json::Value = serde_json::from_str(line)?;
+    match resp_msg["type"].as_str() {
+        Some("ai_response") => Ok(serde_json::from_value(resp_msg["payload"].clone())?),
+        Some("error") => {
+            let payload: RemoteAiErrorPayload =
+                serde_json::from_value(resp_msg["payload"].clone())?;
+            Err(payload.into_error().into())
+        }
+        _ => bail!("Unexpected response type: {:?}", resp_msg["type"]),
+    }
 }
 
 /// Token usage statistics for an AI interaction.
@@ -159,6 +295,15 @@ pub struct ProviderCapabilities {
     pub context_window_size: usize,
 }
 
+/// Cache statistics returned by providers that support local response caching.
+#[derive(Debug, Clone, Default)]
+pub struct CacheStats {
+    pub hits_this_session: u64,
+    pub hits_prev_session: u64,
+    pub tokens_saved_this_session: u64,
+    pub tokens_saved_prev_session: u64,
+}
+
 /// Trait defining the standard interface for all AI providers in Sashiko.
 #[async_trait]
 pub trait AiProvider: Send + Sync {
@@ -170,6 +315,32 @@ pub trait AiProvider: Send + Sync {
 
     /// Returns the capabilities and constraints of this provider.
     fn get_capabilities(&self) -> ProviderCapabilities;
+
+    /// Returns cache statistics, if the provider supports local response caching.
+    fn cache_stats(&self) -> Option<CacheStats> {
+        None
+    }
+}
+
+/// Creates an AI provider, optionally wrapping it with a local response cache.
+pub async fn create_provider_cached(
+    settings: &Settings,
+    enable_cache: bool,
+    cache_ttl_days: u64,
+) -> Result<Arc<dyn AiProvider>> {
+    let provider = create_provider(settings)?;
+    if enable_cache {
+        let cache_path = std::path::Path::new(&settings.database.url)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("response_cache.db");
+        let cached =
+            cache::CachingAiProvider::new(provider, &cache_path.to_string_lossy(), cache_ttl_days)
+                .await?;
+        Ok(Arc::new(cached))
+    } else {
+        Ok(provider)
+    }
 }
 
 /// Creates an AI provider based on the application settings.
@@ -265,26 +436,81 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
                 settings.ai.api_timeout_secs,
             )))
         }
-        "claude-cli" => Ok(Arc::new(claude_cli::ClaudeCliProvider {
-            model: settings.ai.model.clone(),
-        })),
+        "claude-cli" => {
+            let cfg = settings.ai.claude_cli.as_ref();
+            Ok(Arc::new(claude_cli::ClaudeCliProvider {
+                model: settings.ai.model.clone(),
+                effort: cfg.and_then(|c| c.effort.clone()),
+            }))
+        }
         "codex-cli" => Ok(Arc::new(codex_cli::CodexCliProvider {
             model: settings.ai.model.clone(),
         })),
+        "copilot-cli" => Ok(Arc::new(copilot_cli::CopilotCliProvider {
+            model: settings.ai.model.clone(),
+        })),
+        "kiro-cli" => {
+            let cfg = settings.ai.kiro_cli.as_ref();
+            Ok(Arc::new(kiro_cli::KiroCliProvider {
+                model: settings.ai.model.clone(),
+                binary: cfg
+                    .map(|c| c.binary.clone())
+                    .unwrap_or_else(|| "kiro-cli".to_string()),
+                agent: cfg.and_then(|c| c.agent.clone()),
+                context_window_size: cfg.map(|c| c.context_window_size).unwrap_or(200_000),
+                timeout_secs: settings.ai.api_timeout_secs,
+            }))
+        }
+        #[cfg(feature = "vertex")]
+        "vertex" => {
+            let model = settings.ai.model.clone();
+            let vertex = settings.ai.vertex.as_ref();
+            let project_id = vertex
+                .and_then(|v| v.project_id.clone())
+                .or_else(|| std::env::var("ANTHROPIC_VERTEX_PROJECT_ID").ok())
+                .context(
+                    "Vertex AI requires project_id in [ai.vertex] \
+                     or ANTHROPIC_VERTEX_PROJECT_ID env var",
+                )?;
+            let region = vertex
+                .and_then(|v| v.region.clone())
+                .or_else(|| std::env::var("CLOUD_ML_REGION").ok())
+                .unwrap_or_else(|| "us-east5".to_string());
+            let enable_caching = vertex.map(|v| v.prompt_caching).unwrap_or(true);
+            let max_tokens = vertex.map(|v| v.max_tokens).unwrap_or(8192);
+            let thinking = vertex.and_then(|v| v.thinking.clone());
+            let effort = vertex.and_then(|v| v.effort.clone());
+            Ok(Arc::new(vertex::VertexClient::new(
+                model,
+                project_id,
+                region,
+                enable_caching,
+                max_tokens,
+                thinking,
+                effort,
+            )?))
+        }
+        #[cfg(not(feature = "vertex"))]
+        "vertex" => bail!("vertex provider requires the 'vertex' feature"),
         p => bail!("Unsupported AI provider: {}", p),
     }
 }
 #[cfg(feature = "bedrock")]
 pub mod bedrock;
+pub mod cache;
 pub mod claude;
 pub mod claude_cli;
 pub mod codex_cli;
+pub mod copilot_cli;
 pub mod gemini;
+pub mod kiro_cli;
 pub mod openai;
 pub mod proxy;
 pub mod quota;
 pub mod token_budget;
 pub mod truncator;
+#[cfg(feature = "vertex")]
+pub mod vertex;
 
 /// Recursively removes `thought_signature` and `thoughtSignature` fields from a JSON value.
 pub fn scrub_thought_signatures(val: &mut serde_json::Value) {
@@ -308,6 +534,8 @@ pub fn scrub_thought_signatures(val: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::prompts::ReviewError;
+    use anyhow::anyhow;
     use serde_json::json;
 
     #[test]
@@ -318,6 +546,7 @@ mod tests {
                 role: AiRole::User,
                 content: Some("Hello".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
             }],
@@ -387,6 +616,267 @@ mod tests {
         assert_eq!(usage.total_tokens, 150);
 
         Ok(())
+    }
+
+    fn assert_remote_ai_error_payload_wire_format(
+        class: AiErrorClass,
+        expected: serde_json::Value,
+    ) -> Result<()> {
+        let payload = RemoteAiErrorPayload::new("x".to_string(), class);
+        let serialized = serde_json::to_value(&payload)?;
+
+        assert_eq!(serialized, expected);
+
+        let round_trip: RemoteAiErrorPayload = serde_json::from_value(serialized)?;
+        assert_eq!(round_trip, payload);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remote_ai_error_payload_rate_limit_wire_format() -> Result<()> {
+        assert_remote_ai_error_payload_wire_format(
+            AiErrorClass::RateLimit {
+                retry_after: Duration::from_secs(42),
+            },
+            json!({
+                "message": "x",
+                "class": "rate_limit",
+                "retry_after_secs": 42
+            }),
+        )
+    }
+
+    #[test]
+    fn test_remote_ai_error_payload_transient_wire_format() -> Result<()> {
+        assert_remote_ai_error_payload_wire_format(
+            AiErrorClass::Transient {
+                retry_after: Duration::from_secs(15),
+            },
+            json!({
+                "message": "x",
+                "class": "transient",
+                "retry_after_secs": 15
+            }),
+        )
+    }
+
+    #[test]
+    fn test_remote_ai_error_payload_fatal_wire_format() -> Result<()> {
+        assert_remote_ai_error_payload_wire_format(
+            AiErrorClass::Fatal,
+            json!({
+                "message": "x",
+                "class": "fatal"
+            }),
+        )
+    }
+
+    #[test]
+    fn test_remote_ai_error_payload_requires_retry_after() {
+        let err = serde_json::from_value::<RemoteAiErrorPayload>(json!({
+            "message": "x",
+            "class": "rate_limit"
+        }))
+        .unwrap_err();
+
+        assert!(err.to_string().contains("retry_after_secs"));
+    }
+
+    fn assert_typed_stdio_error_downcasts(class: AiErrorClass) -> Result<()> {
+        let raw_json = json!({
+            "type": "error",
+            "payload": RemoteAiErrorPayload::new("typed failure".to_string(), class)
+        });
+        let serialized = serde_json::to_string(&raw_json)?;
+
+        let err = decode_stdio_ai_response(&serialized).unwrap_err();
+        let remote = err
+            .downcast_ref::<RemoteAiError>()
+            .expect("typed payload should downcast to RemoteAiError");
+
+        assert_eq!(remote.message, "typed failure");
+        assert_eq!(remote.class, class);
+        assert_eq!(err.to_string(), "Remote AI Error: typed failure");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_stdio_ai_response_typed_rate_limit_error_payload() -> Result<()> {
+        assert_typed_stdio_error_downcasts(AiErrorClass::RateLimit {
+            retry_after: Duration::from_secs(60),
+        })
+    }
+
+    #[test]
+    fn test_decode_stdio_ai_response_typed_transient_error_payload() -> Result<()> {
+        assert_typed_stdio_error_downcasts(AiErrorClass::Transient {
+            retry_after: Duration::from_secs(5),
+        })
+    }
+
+    #[test]
+    fn test_decode_stdio_ai_response_typed_fatal_error_payload() -> Result<()> {
+        assert_typed_stdio_error_downcasts(AiErrorClass::Fatal)
+    }
+
+    #[test]
+    fn test_decode_stdio_ai_response_rejects_non_object_error_payload() -> Result<()> {
+        let raw_json = json!({
+            "type": "error",
+            "payload": "Rate limit exceeded, retry after 60s"
+        });
+        let serialized = serde_json::to_string(&raw_json)?;
+
+        let err = decode_stdio_ai_response(&serialized).unwrap_err();
+
+        assert!(err.to_string().contains("invalid type"));
+        assert!(err.downcast_ref::<RemoteAiError>().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_stdio_ai_response_malformed_typed_error_payload() -> Result<()> {
+        let raw_json = json!({
+            "type": "error",
+            "payload": {
+                "message": "try again later",
+                "class": "transient"
+            }
+        });
+        let serialized = serde_json::to_string(&raw_json)?;
+
+        let err = decode_stdio_ai_response(&serialized).unwrap_err();
+
+        assert!(err.to_string().contains("retry_after_secs"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_remote_ai_error_classifies_from_payload_class() {
+        let retry_after = Duration::from_secs(42);
+        let err = RemoteAiError {
+            message: "remote rate limit".to_string(),
+            class: AiErrorClass::RateLimit { retry_after },
+        };
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::RateLimit { retry_after }
+        );
+    }
+
+    #[test]
+    fn test_classify_status_code_rate_limit() {
+        assert_eq!(
+            classify_status_code(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            Some(AiErrorClass::RateLimit {
+                retry_after: DEFAULT_RETRY_AFTER,
+            })
+        );
+    }
+
+    #[test]
+    fn test_classify_status_code_server_error() {
+        assert_eq!(
+            classify_status_code(reqwest::StatusCode::SERVICE_UNAVAILABLE),
+            Some(AiErrorClass::Transient {
+                retry_after: DEFAULT_RETRY_AFTER,
+            })
+        );
+    }
+
+    #[test]
+    fn test_classify_status_code_other() {
+        assert_eq!(classify_status_code(reqwest::StatusCode::BAD_REQUEST), None);
+    }
+
+    fn assert_ai_error_class(error: impl Into<anyhow::Error>, expected: AiErrorClass) {
+        let error = error.into();
+        assert_eq!(classify_ai_error(&error), expected);
+    }
+
+    #[test]
+    fn test_classify_ai_error_remote_rate_limit() {
+        let retry_after = Duration::from_secs(42);
+        assert_ai_error_class(
+            RemoteAiError {
+                message: "remote rate limit".to_string(),
+                class: AiErrorClass::RateLimit { retry_after },
+            },
+            AiErrorClass::RateLimit { retry_after },
+        );
+    }
+
+    #[test]
+    fn test_classify_ai_error_remote_transient() {
+        let retry_after = Duration::from_secs(15);
+        assert_ai_error_class(
+            RemoteAiError {
+                message: "remote transient".to_string(),
+                class: AiErrorClass::Transient { retry_after },
+            },
+            AiErrorClass::Transient { retry_after },
+        );
+    }
+
+    #[test]
+    fn test_classify_ai_error_remote_fatal() {
+        assert_ai_error_class(
+            RemoteAiError {
+                message: "remote fatal".to_string(),
+                class: AiErrorClass::Fatal,
+            },
+            AiErrorClass::Fatal,
+        );
+    }
+
+    #[test]
+    fn test_classify_ai_error_provider_cascade() {
+        assert_ai_error_class(
+            openai::OpenAiCompatError::RateLimitExceeded(Duration::from_secs(7)),
+            AiErrorClass::RateLimit {
+                retry_after: Duration::from_secs(7),
+            },
+        );
+        assert_ai_error_class(
+            claude::ClaudeError::OverloadedError(Duration::from_secs(9)),
+            AiErrorClass::Transient {
+                retry_after: Duration::from_secs(9),
+            },
+        );
+        assert_ai_error_class(
+            gemini::GeminiError::TransientError(Duration::from_secs(11), "busy".to_string()),
+            AiErrorClass::Transient {
+                retry_after: Duration::from_secs(11),
+            },
+        );
+        assert_ai_error_class(
+            ReviewError::FormatRejection("bad response".to_string()),
+            AiErrorClass::Fatal,
+        );
+    }
+
+    #[test]
+    fn test_classify_ai_error_unrelated_error_is_fatal() {
+        assert_ai_error_class(anyhow!("totally unrelated error"), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_classify_ai_error_string_shaped_remote_error_is_fatal() {
+        assert_ai_error_class(
+            anyhow!("Remote AI Error: rate limit exceeded"),
+            AiErrorClass::Fatal,
+        );
+    }
+
+    #[test]
+    fn test_classify_status_code_not_implemented_is_fatal() {
+        assert_eq!(
+            classify_status_code(reqwest::StatusCode::NOT_IMPLEMENTED),
+            None
+        );
     }
 
     #[test]

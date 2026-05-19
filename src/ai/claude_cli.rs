@@ -34,11 +34,13 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::ai::{
-    AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ProviderCapabilities, ToolCall,
+    AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiUsage, ProviderCapabilities,
+    ToolCall,
 };
 
 pub struct ClaudeCliProvider {
     pub model: String,
+    pub effort: Option<String>,
 }
 
 #[async_trait]
@@ -58,11 +60,17 @@ impl AiProvider for ClaudeCliProvider {
         args.push("--model".to_string());
         args.push(self.model.clone());
 
+        if let Some(effort) = &self.effort {
+            args.push("--effort".to_string());
+            args.push(effort.clone());
+        }
+
         let mut child = Command::new("claude")
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn claude CLI: {}. Is it installed?", e))?;
 
@@ -87,7 +95,17 @@ impl AiProvider for ClaudeCliProvider {
             }
         }
 
+        let raw = String::from_utf8_lossy(&output.stdout);
+
         if !output.status.success() {
+            // Try to extract the actual error message from the JSON output.
+            // The CLI emits a JSON object with is_error=true and the reason
+            // in the "result" field even when it exits non-zero.
+            if let Ok(outer) = serde_json::from_str::<Value>(&raw)
+                && let Some(msg) = outer["result"].as_str()
+            {
+                anyhow::bail!("claude CLI error: {}", msg);
+            }
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!(
                 "claude CLI exited with {}: {}",
@@ -95,8 +113,6 @@ impl AiProvider for ClaudeCliProvider {
                 stderr.trim()
             );
         }
-
-        let raw = String::from_utf8_lossy(&output.stdout);
         let outer: Value = serde_json::from_str(&raw).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to parse claude CLI JSON output: {}\nRaw: {}",
@@ -134,8 +150,22 @@ impl AiProvider for ClaudeCliProvider {
     fn get_capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             model_name: self.model.clone(),
-            context_window_size: 200_000,
+            context_window_size: context_window_for_model(&self.model),
         }
+    }
+}
+
+/// Pick the context window to advertise for a given model name. The value is
+/// currently metadata only (no consumer gates on it), so the mapping is coarse.
+/// Opus 4.7 ships with a 1M window by default via Claude Code, and any model
+/// can be selected with the `[1m]` suffix to opt into the 1M variant.
+/// Verified against Claude Code 2.1.132 for opus-4-7, sonnet-4-6, sonnet-4-6[1m],
+/// haiku-4-5.
+fn context_window_for_model(model: &str) -> usize {
+    if model.contains("[1m]") || model.contains("opus-4-7") {
+        1_000_000
+    } else {
+        200_000
     }
 }
 
@@ -209,6 +239,23 @@ pub fn build_prompt(request: &AiRequest) -> String {
              For your final answer: {\"content\": \"YOUR RESPONSE\"}\n\
              Do not mix both. Output exactly one JSON object.\n",
         );
+    } else if matches!(request.response_format, Some(AiResponseFormat::Json { .. })) {
+        // No tools but JSON format required (e.g. Phase 0, Planning).
+        if let Some(AiResponseFormat::Json {
+            schema: Some(schema),
+        }) = &request.response_format
+        {
+            out.push_str(&format!(
+                "RESPONSE FORMAT: You MUST respond with valid JSON only matching this schema: {}. \
+                 Do not include any explanation, markdown, or code fences — output raw JSON.\n",
+                serde_json::to_string(schema).unwrap_or_default()
+            ));
+        } else {
+            out.push_str(
+                "RESPONSE FORMAT: You MUST respond with valid JSON only. \
+                 Do not include any explanation, markdown, or code fences — output raw JSON.\n",
+            );
+        }
     }
 
     out
@@ -267,6 +314,7 @@ pub fn parse_inner_response(text: &str, usage: Option<AiUsage>) -> Result<AiResp
         return Ok(AiResponse {
             content: None,
             thought: None,
+            thought_signature: None,
             tool_calls: Some(merged_tool_calls),
             usage,
         });
@@ -278,6 +326,7 @@ pub fn parse_inner_response(text: &str, usage: Option<AiUsage>) -> Result<AiResp
         return Ok(AiResponse {
             content: Some(text.to_string()),
             thought: None,
+            thought_signature: None,
             tool_calls: None,
             usage,
         });
@@ -288,6 +337,7 @@ pub fn parse_inner_response(text: &str, usage: Option<AiUsage>) -> Result<AiResp
     Ok(AiResponse {
         content: Some(text.to_string()),
         thought: None,
+        thought_signature: None,
         tool_calls: None,
         usage,
     })
@@ -314,6 +364,7 @@ fn parse_single_json(v: &Value, json_str: &str, usage: Option<AiUsage>) -> Resul
             return Ok(AiResponse {
                 content: None,
                 thought: None,
+                thought_signature: None,
                 tool_calls: Some(tool_calls),
                 usage,
             });
@@ -325,6 +376,7 @@ fn parse_single_json(v: &Value, json_str: &str, usage: Option<AiUsage>) -> Resul
         return Ok(AiResponse {
             content: Some(content.to_string()),
             thought: None,
+            thought_signature: None,
             tool_calls: None,
             usage,
         });
@@ -334,6 +386,7 @@ fn parse_single_json(v: &Value, json_str: &str, usage: Option<AiUsage>) -> Resul
     Ok(AiResponse {
         content: Some(json_str.to_string()),
         thought: None,
+        thought_signature: None,
         tool_calls: None,
         usage,
     })
@@ -356,4 +409,91 @@ fn extract_json(text: &str) -> String {
         }
     }
     normalized.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::{AiMessage, AiRequest, AiResponseFormat, AiRole, AiTool};
+    use serde_json::json;
+
+    fn make_request(messages: Vec<AiMessage>) -> AiRequest {
+        AiRequest {
+            system: None,
+            messages,
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        }
+    }
+
+    fn simple_user_msg() -> Vec<AiMessage> {
+        vec![AiMessage {
+            role: AiRole::User,
+            content: Some("hi".to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }]
+    }
+
+    #[test]
+    fn test_build_prompt_json_format_without_tools() {
+        let mut req = make_request(simple_user_msg());
+        req.response_format = Some(AiResponseFormat::Json { schema: None });
+
+        let prompt = build_prompt(&req);
+        assert!(prompt.contains("RESPONSE FORMAT"));
+        assert!(prompt.contains("valid JSON only"));
+        assert!(!prompt.contains("tool_calls"));
+    }
+
+    #[test]
+    fn test_build_prompt_json_format_with_schema() {
+        let mut req = make_request(simple_user_msg());
+        req.response_format = Some(AiResponseFormat::Json {
+            schema: Some(
+                json!({"type": "object", "properties": {"selected_prompts": {"type": "array"}}}),
+            ),
+        });
+
+        let prompt = build_prompt(&req);
+        assert!(prompt.contains("RESPONSE FORMAT"));
+        assert!(prompt.contains("selected_prompts"));
+        assert!(prompt.contains("matching this schema"));
+    }
+
+    #[test]
+    fn test_build_prompt_with_tools_includes_format() {
+        let mut req = make_request(simple_user_msg());
+        req.tools = Some(vec![AiTool {
+            name: "git_log".to_string(),
+            description: "Show git log".to_string(),
+            parameters: json!({"type": "object"}),
+        }]);
+
+        let prompt = build_prompt(&req);
+        assert!(prompt.contains("RESPONSE FORMAT"));
+        assert!(prompt.contains("tool_calls"));
+        assert!(prompt.contains("<available_tools>"));
+    }
+
+    #[test]
+    fn test_build_prompt_text_format_no_instruction() {
+        let mut req = make_request(simple_user_msg());
+        req.response_format = Some(AiResponseFormat::Text);
+
+        let prompt = build_prompt(&req);
+        assert!(!prompt.contains("RESPONSE FORMAT"));
+    }
+
+    #[test]
+    fn test_build_prompt_no_format_no_instruction() {
+        let req = make_request(simple_user_msg());
+
+        let prompt = build_prompt(&req);
+        assert!(!prompt.contains("RESPONSE FORMAT"));
+    }
 }

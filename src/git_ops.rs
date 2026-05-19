@@ -68,20 +68,42 @@ impl GitWorktree {
 
         info!("Creating worktree at {:?}", path);
 
+        // Split worktree creation into two phases:
+        // 1) metadata update (under lock, fast)
+        // 2) file checkout (no lock, parallelizable)
+        let output = {
+            let lock = get_worktree_lock();
+            let _guard = lock.lock().await;
+            Command::new("git")
+                .current_dir(repo_path)
+                .args(["-c", "safe.bareRepository=all"])
+                .arg("worktree")
+                .arg("add")
+                .arg("--detach")
+                .arg("--no-checkout")
+                .arg(&path)
+                .arg(commit_hash)
+                .output()
+                .await?
+        };
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "Failed to create worktree: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+
         let output = Command::new("git")
-            .current_dir(repo_path)
+            .current_dir(&path)
             .args(["-c", "safe.bareRepository=all"])
-            .arg("worktree")
-            .arg("add")
-            .arg("--detach")
-            .arg(&path)
-            .arg(commit_hash)
+            .args(["reset", "--hard", commit_hash])
             .output()
             .await?;
 
         if !output.status.success() {
             return Err(anyhow!(
-                "Failed to create worktree: {}",
+                "Failed to populate worktree: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
@@ -109,6 +131,7 @@ impl GitWorktree {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()?;
 
         if let Some(mut stdin) = child.stdin.take() {
@@ -149,6 +172,7 @@ impl GitWorktree {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()?;
 
         if let Some(mut stdin) = child.stdin.take() {
@@ -270,15 +294,27 @@ impl GitWorktree {
             return Ok(());
         }
         info!("Removing worktree at {:?}", self.path);
-        let output = Command::new("git")
-            .current_dir(&self.repo_path)
-            .args(["-c", "safe.bareRepository=all"])
-            .arg("worktree")
-            .arg("remove")
-            .arg("-f")
-            .arg(&self.path)
-            .output()
-            .await?;
+
+        // Split worktree removal into two phases:
+        // 1) directory cleanup (no lock, parallelizable)
+        // 2) metadata removal (under lock, fast)
+        if self.path.exists() {
+            std::fs::remove_dir_all(&self.path)?;
+        }
+
+        let output = {
+            let lock = get_worktree_lock();
+            let _guard = lock.lock().await;
+            Command::new("git")
+                .current_dir(&self.repo_path)
+                .args(["-c", "safe.bareRepository=all"])
+                .arg("worktree")
+                .arg("remove")
+                .arg("-f")
+                .arg(&self.path)
+                .output()
+                .await?
+        };
 
         if !output.status.success() {
             return Err(anyhow!(
@@ -314,13 +350,17 @@ pub async fn read_blob(repo_path: &Path, hash: &str) -> Result<Vec<u8>> {
 #[allow(dead_code)]
 pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
     info!("Pruning git worktrees in {:?}", repo_path);
-    let output = Command::new("git")
-        .current_dir(repo_path)
-        .args(["-c", "safe.bareRepository=all"])
-        .arg("worktree")
-        .arg("prune")
-        .output()
-        .await?;
+    let output = {
+        let lock = get_worktree_lock();
+        let _guard = lock.lock().await;
+        Command::new("git")
+            .current_dir(repo_path)
+            .args(["-c", "safe.bareRepository=all"])
+            .arg("worktree")
+            .arg("prune")
+            .output()
+            .await?
+    };
 
     if !output.status.success() {
         return Err(anyhow!(
@@ -372,13 +412,28 @@ fn get_global_config_lock() -> Arc<AsyncMutex<()>> {
         .clone()
 }
 
+fn get_worktree_lock() -> Arc<AsyncMutex<()>> {
+    static WORKTREE_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
+    WORKTREE_LOCK
+        .get_or_init(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
 pub async fn ensure_remote(
     repo_path: &Path,
     name: &str,
     url: &str,
     force_fetch: bool,
 ) -> Result<()> {
-    // 1. Security Check (Skipped - trusting MAINTAINERS)
+    // 1. Validate repo_path to prevent git from traversing up to parent repos
+    if !repo_path.join(".git").exists() && !repo_path.join("HEAD").exists() {
+        return Err(anyhow::anyhow!(
+            "{} is not a valid git repository. Did you forget to initialize submodules?",
+            repo_path.display()
+        ));
+    }
+
+    // 2. Security Check (Skipped - trusting MAINTAINERS)
     // acquire remote-specific lock
     let lock = get_remote_lock(name);
     let _guard = lock.lock().await;
@@ -464,7 +519,7 @@ pub async fn ensure_remote(
         info!("Fetching remote {}", name);
         let mut fetch = Command::new("git")
             .current_dir(repo_path)
-            .args(["fetch", "--prune", name])
+            .args(["fetch", "--prune", "--no-tags", name])
             .output()
             .await?;
 
@@ -491,7 +546,7 @@ pub async fn ensure_remote(
                     // Retry the fetch once
                     fetch = Command::new("git")
                         .current_dir(repo_path)
-                        .args(["fetch", "--prune", name])
+                        .args(["fetch", "--prune", "--no-tags", name])
                         .output()
                         .await?;
                 }
@@ -535,6 +590,31 @@ pub async fn ensure_remote(
     }
 
     Ok(())
+}
+
+pub async fn get_remote_branches(repo_path: &Path, remote_name: &str) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["branch", "-r", "--list", &format!("{}/*", remote_name)])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Failed to list remote branches: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let branches = stdout
+        .lines()
+        .map(|line| line.trim())
+        .filter_map(|line| line.strip_prefix(&format!("{}/", remote_name)))
+        .filter(|s| !s.contains("->")) // Filter out symbolic references like HEAD -> origin/main
+        .map(|s| s.to_string())
+        .collect();
+    Ok(branches)
 }
 
 pub async fn get_commit_hash(path: &Path, ref_name: &str) -> Result<String> {
@@ -788,6 +868,122 @@ pub async fn git_tag(repo_path: &Path) -> Result<String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
+}
+
+/// Metadata extracted from a single git commit.
+pub struct PatchMetadata {
+    pub author: String,
+    pub subject: String,
+    pub message: String,
+    pub diff: String,
+    pub base_commit: Option<String>,
+    pub timestamp: i64,
+}
+
+/// Resolve a git range (e.g. "HEAD~3..HEAD") to an ordered list of commit SHAs.
+pub async fn resolve_git_range(repo_path: &Path, range: &str) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["-c", "safe.bareRepository=all"])
+        .args(["rev-list", "--reverse", range])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Failed to resolve git range '{}': {}",
+            range,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let shas: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+
+    if shas.is_empty() {
+        return Err(anyhow!("Git range '{}' is empty", range));
+    }
+
+    Ok(shas)
+}
+
+/// Extract patch metadata from a commit using `git show`.
+pub async fn extract_patch_metadata(repo_path: &Path, commit: &str) -> Result<PatchMetadata> {
+    // Resolve parent to use as base_commit
+    let parent_output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["rev-parse", &format!("{}^", commit)])
+        .output()
+        .await?;
+
+    let base_commit = if parent_output.status.success() {
+        Some(
+            String::from_utf8_lossy(&parent_output.stdout)
+                .trim()
+                .to_string(),
+        )
+    } else {
+        warn!(
+            "Failed to resolve parent for {}, using commit as base",
+            commit
+        );
+        Some(commit.to_string())
+    };
+
+    let format = "format:%an%n%ae%n%s%n%b%n---SASHIKO-END-HEADER---%n";
+
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["show", &format!("--format={}", format), commit])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git show failed for {}: {}",
+            commit,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout).to_string();
+    let parts: Vec<&str> = raw.split("---SASHIKO-END-HEADER---\n").collect();
+
+    if parts.len() < 2 {
+        return Err(anyhow!("Failed to parse git show output for {}", commit));
+    }
+
+    let header_part = parts[0];
+    let diff = parts[1..].join("---SASHIKO-END-HEADER---\n");
+
+    let mut lines = header_part.lines();
+    let author_name = lines.next().unwrap_or_default().trim();
+    let author_email = lines.next().unwrap_or("unknown@localhost").trim();
+    let subject = lines.next().unwrap_or("No Subject").trim();
+
+    let body: Vec<&str> = lines.collect();
+    let message = body.join("\n").trim().to_string();
+
+    let author = if author_name.is_empty() || author_name.to_lowercase() == "unknown" {
+        author_email.to_string()
+    } else {
+        format!("{} <{}>", author_name, author_email)
+    };
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+
+    Ok(PatchMetadata {
+        author,
+        subject: subject.to_string(),
+        message,
+        diff,
+        base_commit,
+        timestamp,
+    })
 }
 
 #[cfg(test)]

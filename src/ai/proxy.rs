@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ai::gemini::{GeminiClient, GeminiError, GenerateContentRequest};
+use crate::ai::gemini::{GeminiClient, GenerateContentRequest};
 use crate::ai::quota::QuotaManager;
+use crate::ai::{AiErrorClass, classify_ai_error};
 use axum::{
     extract::{Json, State},
     http::StatusCode,
@@ -31,6 +32,7 @@ pub async fn handle_generate(
     State(state): State<Arc<ProxyState>>,
     Json(request): Json<GenerateContentRequest>,
 ) -> impl IntoResponse {
+    let mut local_transient_errors = 0;
     loop {
         // 1. Wait if globally blocked
         let _slept = state.quota_manager.wait_for_access().await;
@@ -42,18 +44,26 @@ pub async fn handle_generate(
                 return (StatusCode::OK, Json(response)).into_response();
             }
             Err(e) => {
-                if let Some(err) = e.downcast_ref::<GeminiError>() {
-                    match err {
-                        GeminiError::QuotaExceeded(duration) => {
-                            state.quota_manager.report_quota_error(*duration).await;
-                            continue;
-                        }
-                        GeminiError::TransientError(_, _) => {
-                            state.quota_manager.report_transient_error().await;
-                            continue;
-                        }
-                        _ => {}
+                match classify_ai_error(&e) {
+                    AiErrorClass::RateLimit { retry_after } => {
+                        state.quota_manager.report_quota_error(retry_after).await;
+                        continue;
                     }
+                    AiErrorClass::Transient { retry_after } => {
+                        local_transient_errors += 1;
+                        let backoff_secs =
+                            (1.0 * (2.0_f64.powi(local_transient_errors - 1))).min(60.0);
+                        let backoff =
+                            std::time::Duration::from_secs_f64(backoff_secs).max(retry_after);
+                        tracing::warn!(
+                            "AI provider transient error (streak: {}). Locally backing off for {:.2}s",
+                            local_transient_errors,
+                            backoff.as_secs_f64()
+                        );
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    AiErrorClass::Fatal => {}
                 }
 
                 error!("Gemini Proxy Error: {}", e);
