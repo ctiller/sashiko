@@ -552,6 +552,7 @@ impl Worker {
                     role: AiRole::User,
                     content: Some(phase0_prompt),
                     thought: None,
+                    thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
                 }],

@@ -143,10 +143,16 @@ async fn main() -> Result<()> {
                 api_timeout_secs: 300,
                 no_ai: false,
                 log_turns: false,
+                response_cache: false,
+                response_cache_ttl_days: 7,
                 claude: None,
                 gemini: None,
                 bedrock: None,
+                #[cfg(feature = "vertex")]
+                vertex: None,
                 openai_compat: None,
+                kiro_cli: None,
+                claude_cli: None,
             },
             server: sashiko::settings::ServerSettings {
                 host: "".to_string(),
@@ -155,6 +161,7 @@ async fn main() -> Result<()> {
             },
             git: sashiko::settings::GitSettings {
                 repository_path: repo_path.to_string_lossy().to_string(),
+                custom_remotes: None,
             },
             review: sashiko::settings::ReviewSettings {
                 concurrency: 1,
